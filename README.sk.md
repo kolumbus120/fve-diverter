@@ -5,7 +5,7 @@
 ESP32 (ESPHome) posiela **prebytok z fotovoltiky do dvoch elektrických špirál**: do bojlera TUV
 (špirála 3 kW) a do vody podlahového kúrenia (špirála ~600 W). Každú špirálu riadi TRIAC doska
 cez I2C. Nie je to obyčajný „router na nulu na prípojke“: počíta s **batériou hybridného
-meniča** aj s **tepelným čerpadlom Daikin Altherma**. Pomalšie rozhodnutia robí Home Assistant:
+meniča (nabíjanie aj stav nabitia, SoC)** aj s **tepelným čerpadlom Daikin Altherma**. Pomalšie rozhodnutia robí Home Assistant:
 kedy znížiť Daikin, lebo dom hreje slnko, kedy Daikin nemá ohrievať TUV, lebo ju ohreje slnko,
 a týždenný plán kúrenia s vlastnou kartou.
 
@@ -13,6 +13,8 @@ Doma beží od 15. 11. 2026. **Doska plošných spojov je navrhnutá a objednan�
 osadená** (viď [Doska](#doska-plošných-spojov) nižšie).
 
 ![Prehľad systému](docs/schematics/fve_schema.png)
+
+*Hlavná schéma: [SVG](docs/schematics/fve_schema.svg) · [PNG](docs/schematics/fve_schema.png) · anglická verzia [SVG](docs/schematics/fve_schema_en.svg) / [PNG](docs/schematics/fve_schema_en.png).*
 
 ## Čo to robí
 
@@ -27,6 +29,13 @@ Assistanta:
     siete, pridá sa.
   - Pri každom novom údaji zo Solaxu sa výkon nastaví podľa cieľa. Počíta sa s tým, koľko špirály
     brali v čase toho merania.
+- **Batéria a SoC:** na rozdiel od routerov, ktoré vidia len sieť, vie, koľko sa nabíja batéria
+  a aký má stav nabitia.
+  - Batéria dostane svoj podiel prednostne (rezerva 300 W, ¼ prebytku nad podlahou; podiel sa
+    dá nastaviť).
+  - Keď sa batéria považuje za plnú (SoC ≥ 97 %, nastaviteľné), ide celý prebytok do TUV.
+  - Pri slabej predpovedi Solcast na zajtra sa môže zvýšiť minimálne SoC meniča ako záloha
+    (čaká na lokálny Solax dongl).
 - **Ochrana pri výpadku:** údaj zo Shelly starší ako 15 s → výkon 0 W. Keď nejde Solax alebo HA,
   beží núdzový režim len zo Shelly: hreje len z viditeľného pretoku a drží asi 300 W pretok.
 - **TRIAC a stykače:** pred každým TRIAC-om je izolačný stykač. Bypass stykač preberá prúd pri

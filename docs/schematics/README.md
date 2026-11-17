@@ -26,5 +26,6 @@ napätie v HA (0 A) ukáže, ktoré to je. Generátor: `gen_mobil_test_delica.py
 | [`fve_schema_riadenie.png`](fve_schema_riadenie.png) | prehľad ESP32 vstupy/výstupy |
 | [`fve_schema_realny.png`](fve_schema_realny.png) | silová časť |
 | [`fve_schema.png`](fve_schema.png) | celý prehľad (+ `_zapojenie`, `_dimmer_detail`) |
+| [`fve_schema_en.png`](fve_schema_en.png) / [`.svg`](fve_schema_en.svg) | celý prehľad po anglicky (`gen_fve_schema_en.py` preloží `fve_schema.svg`) |
 
 PNG sa generujú zo `gen_*.py` (`python3 gen_….py`, potrebuje `rsvg-convert`).

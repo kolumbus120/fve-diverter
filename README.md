@@ -5,7 +5,7 @@
 An ESP32 (ESPHome) that sends **solar PV surplus into two electric heaters**: the domestic
 hot water tank (3 kW element) and the underfloor heating water (~600 W element). Each heater is
 driven by a TRIAC board controlled over I2C. Unlike a plain "keep the grid at 0 W" router, it
-works with the **battery of a hybrid inverter** and with the **Daikin Altherma heat pump**. A set
+works with the **battery of a hybrid inverter (charging power and state of charge, SoC)** and with the **Daikin Altherma heat pump**. A set
 of Home Assistant packages makes the slower decisions: when to turn the heat pump down because
 the sun heats the house, when the heat pump must not heat the hot water because the sun will,
 and a weekly heating plan with a custom Lovelace card.
@@ -13,7 +13,9 @@ and a weekly heating plan with a custom Lovelace card.
 It runs at home since 2026-11-15. The **PCB is designed and ordered but not built yet**
 (see [PCB](#pcb--carrier-board) below).
 
-![System overview](docs/schematics/fve_schema.png)
+![System overview](docs/schematics/fve_schema_en.png)
+
+*Main schematic: [SVG](docs/schematics/fve_schema_en.svg) · [PNG](docs/schematics/fve_schema_en.png) (Slovak original: [`fve_schema.svg`](docs/schematics/fve_schema.svg)).*
 
 > Code comments and most of the docs in `docs/` are in **Slovak**. Entity names in Home Assistant
 > are Slovak too (e.g. *TUV* = domestic hot water, *podlaha* = underfloor heating,
@@ -33,6 +35,14 @@ Home Assistant too:
     power flows out to the grid, they get more.
   - Each new Solax reading moves the heaters toward the target, taking into account what the
     heaters drew at the time of that reading.
+- **Battery-aware (SoC):** unlike grid-only routers, it knows how much the battery is charging
+  and its state of charge.
+  - The battery gets its share first (300 W reserve, ¼ of the surplus above the floor element;
+    the share is adjustable).
+  - Once the battery counts as full (SoC ≥ 97 %, adjustable), the whole surplus goes to the hot
+    water.
+  - A weak Solcast forecast for tomorrow can raise the inverter's minimum SoC as a backup reserve
+    (waits for a local Solax dongle).
 - **Fail-safe:** no Shelly data for more than 15 s → heaters at 0 W. If Solax or HA is
   unavailable, an emergency Shelly-only mode heats only from the visible export and keeps about
   300 W of it.
