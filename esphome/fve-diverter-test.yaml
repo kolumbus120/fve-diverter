@@ -1,0 +1,304 @@
+# ============================================================================
+# ESP32 #2 — FVE diverter — TESTOVACIA (servisná) VERZIA  (2026-11-09)
+# ============================================================================
+# Na oživenie HW PRED nahratím ostrej verzie. Načíta celý ostrý súbor
+# (fve-diverter.yaml — relé, senzory, DimmerLink, parametre) a pridá len
+# servisné veci. NIČ NEBEŽÍ AUTOMATICKY (regulácia je v ostrom súbore
+# zakomentovaná) — všetko sa ovláda ručne z HA dashboardu "FVE diverter — test"
+# (home-assistant/dashboards/fve_diverter_test.yaml).
+#
+# Rovnaké meno zariadenia (fve-diverter) → rovnaká IP <IP ESP>, OTA aj
+# entity v HA; ostrá verzia sa neskôr nahrá cez ten istý kanál.
+#
+# POSTUP TESTOVANIA (dohodnuté 2026-11-09):
+#  1. BEZ ZÁŤAŽE: adresy DimmerLinkov (I2C scan; od 2026-11-16 TUV 0x54, podlaha 0x53,
+#     0x50 voľná — pôvodne zmena 0x50→0x51 na druhom
+#     module), adresy DS18B20 (pripájať po jednom), pomocné relé → spínajú
+#     správne veľké stykače (izolačný/bypass TUV a podlaha, čerpadlá).
+#  2. Až po potvrdení bodu 1: reálne záťaže (špirály) — dimmery, bypass
+#     sekvencia (najprv dimmer 100 %, potom bypass), prúd/teplota na doskách.
+#
+# ZAPOJENIE PINOV (nové rozloženie 2026-11-10, schéma
+# ../docs/schematics/esp32_pinout_zapojenie.png) — kontrolný zoznam pre bod 1:
+#   Relé (active-LOW): 17 stykač TUV · 16 bypass TUV · 19 stykač podlaha ·
+#     18 bypass podlaha · 26 čerpadlo TUV · 25 čerpadlo podlaha
+#     (13 = rezerva pre záložné relé VCC fanu skrine — zrušené, nezapojené)
+#   Vstupy: 27 OPTO Daikin čerpadlo podlahy · 14 OPTO Daikin ohrev TUV (cievka
+#     K3M, 2-kan. AC 230 V opto modul) · 4 prietok studenej → TUV · 21 DS18B20
+#   rbdimmer1 TUV: 36 TEMP · 39 CUR-S · 33 FAN
+#   rbdimmer2 podlaha: 34 TEMP · 35 CUR-S · 32 FAN
+#   Fan skrine: 23 PWM · 22 tacho · I2C DimmerLink: 2 SDA · 15 SCL
+#   NEPOUŽÍVAŤ: 12 (strapping). Voľný: 5, 13 (rezerva relé fanu).
+#
+# BEZPEČNOSŤ v teste:
+#  - Auto-vypnutie stykačov, bypassov a dimmerov po N min (default 30, 0 = vyp).
+#  - Tepelná poistka: TUV ≥ max_t_tuv / podlaha ≥ max_t_podlaha → bypass a
+#    dimmer danej vetvy VYP (len pri platnom meraní — bez senzora sa dá testovať).
+#  - Relé po boote VYP (restore_mode ALWAYS_OFF z ostrého súboru) — pri teste
+#    overiť, že po reštarte nič necvakne.
+#
+# Kompilácia/flash: v adresári s reálnym secrets.yaml
+#   esphome run fve-diverter-test.yaml --device <IP ESP>
+# ============================================================================
+
+# Ostrý súbor má reguláciu — tu vypnutá (všetko ručne z HA). Shelly čítanie,
+# diagnostika DimmerLinku, WiFi/uptime sú už v ostrom súbore.
+substitutions:
+  regulacia_aktivna: "false"
+  rele_internal: "false"        # relé v HA ovládateľné (v ostrej verzii len na zobrazenie)
+
+packages:
+  ostra: !include fve-diverter.yaml
+
+esphome:
+  on_boot:
+    - priority: -100
+      then:
+        - delay: 5s
+        - script.execute: test_i2c_scan
+        - script.execute: test_ow_hladaj
+
+interval:
+  # --- Bezpečnosť testu: tepelná poistka + auto-vypnutie -----------------------
+  - interval: 5s
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          // TEPELNÁ POISTKA — len pri platnom meraní (NaN = senzor nepripojený → netestuj ho).
+          // Poradie: najprv bypass (TRIAC prevezme prúd), potom dimmer.
+          if (!std::isnan(id(t_tuv).state) && id(t_tuv).state >= id(max_t_tuv).state) {
+            if (id(bypass_tuv).state) id(bypass_tuv).turn_off();
+            if (id(dimmer_tuv).current_values.is_on()) id(dimmer_tuv).turn_off().perform();
+            ESP_LOGW("test", "Tepelná poistka TUV: %.1f °C", id(t_tuv).state);
+          }
+          if (!std::isnan(id(t_podlaha).state) && id(t_podlaha).state >= id(max_t_podlaha).state) {
+            if (id(bypass_podlaha).state) id(bypass_podlaha).turn_off();
+            if (id(dimmer_podlaha).current_values.is_on()) id(dimmer_podlaha).turn_off().perform();
+            ESP_LOGW("test", "Tepelná poistka podlaha: %.1f °C", id(t_podlaha).state);
+          }
+          // AUTO-VYPNUTIE po N min zapnutia (0 = vypnuté). Bypassy pred dimmermi.
+          static uint32_t since[6] = {0, 0, 0, 0, 0, 0};
+          uint32_t limit_ms = (uint32_t) (id(test_auto_vyp_min).state * 60000.0f);
+          auto chk = [&](int i, bool on) -> bool {     // true = treba vypnúť
+            if (!on) { since[i] = 0; return false; }
+            if (since[i] == 0) { since[i] = now | 1; return false; }
+            if (limit_ms == 0 || now - since[i] <= limit_ms) return false;
+            since[i] = 0;
+            return true;
+          };
+          if (chk(0, id(bypass_tuv).state))     { ESP_LOGW("test", "Auto-vyp: bypass TUV");     id(bypass_tuv).turn_off(); }
+          if (chk(1, id(bypass_podlaha).state)) { ESP_LOGW("test", "Auto-vyp: bypass podlaha"); id(bypass_podlaha).turn_off(); }
+          if (chk(2, id(dimmer_tuv).current_values.is_on()))     { ESP_LOGW("test", "Auto-vyp: dimmer TUV");     id(dimmer_tuv).turn_off().perform(); }
+          if (chk(3, id(dimmer_podlaha).current_values.is_on())) { ESP_LOGW("test", "Auto-vyp: dimmer podlaha"); id(dimmer_podlaha).turn_off().perform(); }
+          if (chk(4, id(stykac_tuv).state))     { ESP_LOGW("test", "Auto-vyp: stykač TUV");     id(stykac_tuv).turn_off(); }
+          if (chk(5, id(stykac_podlaha).state)) { ESP_LOGW("test", "Auto-vyp: stykač podlaha"); id(stykac_podlaha).turn_off(); }
+
+script:
+  # Zmena adresy DimmerLinku 0x50 → nova (tlačidlá „nový modul 0x50 → …“)
+  - id: dimmerlink_zmen_adresu
+    parameters:
+      nova: int
+    then:
+      - lambda: |-
+          if (id(i2c_bus)->write(nova, nullptr, 0) == i2c::ERROR_OK) {
+            ESP_LOGE("test", "Adresa 0x%02X je už obsadená — nič nemením.", nova);
+            return;
+          }
+          if (id(i2c_bus)->write(0x50, nullptr, 0) != i2c::ERROR_OK) {
+            ESP_LOGE("test", "Na 0x50 nič neodpovedá — nič nemením.");
+            return;
+          }
+          const uint8_t data[2] = {0x30, (uint8_t) nova};
+          auto err = id(i2c_bus)->write(0x50, data, 2);
+          ESP_LOGW("test", "Zmena adresy DimmerLink 0x50 -> 0x%02X: %s", nova,
+                   err == i2c::ERROR_OK ? "zápis OK" : "CHYBA zápisu");
+
+  # I2C scan → text senzor (adresy, ktoré odpovedajú). Očakávané (od 2026-11-16):
+  # 0x54 (DimmerLink TUV), 0x53 (DimmerLink podlaha); neskôr 0x52/0x51 rbAmp. 0x50 voľná.
+  - id: test_i2c_scan
+    then:
+      - lambda: |-
+          std::string s;
+          for (uint8_t a = 0x08; a < 0x78; a++) {
+            if (id(i2c_bus)->write(a, nullptr, 0) == i2c::ERROR_OK) {
+              char b[8];
+              snprintf(b, sizeof(b), "0x%02X ", a);
+              s += b;
+            }
+          }
+          ESP_LOGI("test", "I2C scan: %s", s.empty() ? "nič" : s.c_str());
+          id(test_i2c_txt).publish_state(s.empty() ? std::string("nič nenájdené") : s);
+
+  # OneWire hľadanie → text senzor s adresami DS18B20 na každej z 3 zberníc
+  # (G21 bojler, G5 vratná, G13 podlaha). Adresu zapíš do fve-diverter.yaml.
+  - id: test_ow_hladaj
+    then:
+      - lambda: |-
+          // 3 samostatné zbernice (od 2026-11-14): G21 bojler, G5 vratná, G13 podlaha
+          std::string s;
+          auto scan = [&](esphome::gpio::GPIOOneWireBus *bus, const char *nm) {
+            bus->search();
+            s += nm; s += ":";
+            if (bus->get_devices().empty()) s += "—";
+            for (auto a : bus->get_devices()) {
+              char b[24];
+              snprintf(b, sizeof(b), "0x%016llX", (unsigned long long) a);
+              s += b;
+            }
+            s += " ";
+          };
+          scan(id(ow_bus), "G21");
+          scan(id(ow_vratna), "G5");
+          scan(id(ow_podlaha), "G13");
+          ESP_LOGI("test", "DS18B20 adresy: %s", s.empty() ? "nič" : s.c_str());
+          id(test_ow_txt).publish_state(s.empty() ? std::string("nič nenájdené") : s);
+
+button:
+  - platform: template
+    name: "Test — I2C scan"
+    icon: mdi:magnify
+    on_press:
+      - script.execute: test_i2c_scan
+
+  - platform: template
+    name: "Test — hľadať DS18B20"
+    icon: mdi:thermometer-lines
+    on_press:
+      - script.execute: test_ow_hladaj
+
+  # Výpis registrov DimmerLinkov (2026-11-14, diagnostika nezmyselného spätného
+  # čítania úrovne/periódy pri 2CH module). LEN ČÍTA. Pre každú adresu (0x54, 0x53),
+  # ktorá odpovedá, prečíta registre 0x00–0x3F dvoma spôsobmi:
+  #   A = write_readv (zápis registra + repeated start + čítanie, ako komponent)
+  #   B = zápis registra so STOP, potom samostatné čítanie
+  # Do logu: "reg: A B". Postup: nastav dimmer na nápadnú hodnotu (napr. 37 %).
+  - platform: template
+    name: "DimmerLink — výpis registrov (diagnostika)"
+    icon: mdi:format-list-numbered
+    on_press:
+      - lambda: |-
+          // 4 SAMOSTATNÉ prechody (aby sa metódy navzájom neovplyvnili):
+          //  P1 zápis reg + STOP, hneď čítanie · P2 to isté + pauza 2 ms
+          //  P3 to isté + pauza 20 ms · P4 write_readv (repeated start, pôvodný komponent)
+          const uint8_t regs[] = {0x00, 0x02, 0x03, 0x10, 0x11, 0x18, 0x20, 0x21, 0x22, 0x23, 0x30};
+          for (uint8_t addr : {(uint8_t) 0x54, (uint8_t) 0x53}) {
+            if (id(i2c_bus)->write(addr, nullptr, 0) != i2c::ERROR_OK) {
+              ESP_LOGW("regdump", "0x%02X: neodpovedá", addr);
+              continue;
+            }
+            for (int pass = 1; pass <= 4; pass++) {
+              char line[200];
+              int n = snprintf(line, sizeof(line), "0x%02X P%d:", addr, pass);
+              for (uint8_t r : regs) {
+                uint8_t v = 0xEE;
+                bool ok;
+                if (pass == 4) {
+                  ok = id(i2c_bus)->write_readv(addr, &r, 1, &v, 1) == i2c::ERROR_OK;
+                } else {
+                  ok = id(i2c_bus)->write(addr, &r, 1) == i2c::ERROR_OK;
+                  if (pass == 2) delay(2);
+                  if (pass == 3) delay(20);
+                  ok = ok && id(i2c_bus)->read(addr, &v, 1) == i2c::ERROR_OK;
+                }
+                n += snprintf(line + n, sizeof(line) - n, " %02X=%s%02X", r, ok ? "" : "!", v);
+                delay(30);    // oddelenie od ďalšieho registra
+              }
+              ESP_LOGI("regdump", "%s", line);
+            }
+          }
+
+  # Náhradný / nový DimmerLink (z výroby 0x50) → adresa TUV 0x54 alebo podlaha 0x53.
+  # Od 2026-11-16 je 0x50 na zbernici VOĽNÁ, nový modul sa dá pripojiť k ostatným a
+  # adresu mu zmeniť priamo (register 0x30, zmena okamžitá, uloží sa do EEPROM).
+  # Na 0x50 smie byť len JEDEN nový modul rbdimmer. Pred zápisom sa kontroluje, že
+  # cieľová adresa je voľná (napr. starý modul TUV odpojený).
+  - platform: template
+    name: "DimmerLink — nový modul 0x50 → 0x54 (TUV)"
+    icon: mdi:alert
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(dimmerlink_zmen_adresu)->execute(0x54);
+      - delay: 500ms
+      - script.execute: test_i2c_scan
+  - platform: template
+    name: "DimmerLink — nový modul 0x50 → 0x53 (podlaha)"
+    icon: mdi:alert
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(dimmerlink_zmen_adresu)->execute(0x53);
+      - delay: 500ms
+      - script.execute: test_i2c_scan
+
+  # DimmerLink — reset a rekalibrácia (z komponentu)
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_tuv
+    reset:
+      name: "DimmerLink TUV — reset"
+    recalibrate:
+      name: "DimmerLink TUV — rekalibrácia"
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_podlaha
+    reset:
+      name: "DimmerLink podlaha — reset"
+    recalibrate:
+      name: "DimmerLink podlaha — rekalibrácia"
+
+number:
+  - platform: template
+    name: "Test — auto vypnutie špirál po"
+    id: test_auto_vyp_min
+    icon: mdi:timer-off-outline
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    min_value: 0
+    max_value: 240
+    step: 5
+    unit_of_measurement: "min"
+
+# DimmerLink krivka (LINEAR / RMS / LOG) — LEN na skúšky. Ostrá verzia pri štarte
+# nastaví LINEAR (regulácia s ňou počíta). Meranie 2026-11-15: LINEAR = teória
+# fázového riadenia, RMS nezodpovedá (25 % → 0 W).
+select:
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_tuv
+    curve:
+      name: "DimmerLink TUV — krivka"
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_podlaha
+    curve:
+      name: "DimmerLink podlaha — krivka"
+
+text_sensor:
+  - platform: template
+    name: "Test — I2C zariadenia"
+    id: test_i2c_txt
+    icon: mdi:expansion-card
+  - platform: template
+    name: "Test — DS18B20 adresy"
+    id: test_ow_txt
+    icon: mdi:thermometer-lines
+  - platform: template
+    name: "Test — čas ESP (SNTP)"
+    icon: mdi:clock-outline
+    update_interval: 30s
+    lambda: |-
+      auto t = id(esptime).now();
+      if (!t.is_valid()) return std::string("nesynchronizovaný");
+      return t.strftime("%Y-%m-%d %H:%M");
+  - platform: wifi_info
+    ip_address:
+      name: "Test — IP adresa"
+    ssid:
+      name: "Test — WiFi SSID"
+    bssid:
+      name: "Test — WiFi AP (BSSID)"
+
+# Ventilátor skrine — ručne cez PWM (v ostrej verzii ho riadi regulácia)
+fan:
+  - platform: speed
+    output: fan_pwm
+    name: "Test — ventilátor skrine (PWM)"
+    speed_count: 20

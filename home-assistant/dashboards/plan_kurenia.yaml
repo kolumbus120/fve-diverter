@@ -1,0 +1,73 @@
+# HA dashboard "Plán kúrenia" (url_path plan-kurenia, storage mode). Vyžaduje zdroj
+# /local/plan-kurenia-card.js (www/plan-kurenia-card.js → /config/www/, Nastavenia →
+# Dashboardy → Zdroje, typ JavaScript modul) a packages/daikin_plan_kurenia.yaml.
+views:
+- title: Plán
+  path: plan
+  type: sections
+  max_columns: 3
+  sections:
+  - type: grid
+    column_span: 3
+    cards:
+    - type: custom:plan-kurenia-card
+      mode: full
+      grid_options:
+        columns: full
+  - type: grid
+    cards:
+    - type: heading
+      heading: Prázdniny
+      icon: mdi:school-outline
+    - type: entities
+      entities:
+      - entity: input_datetime.plan_prazdniny_od
+        name: Od
+      - entity: input_datetime.plan_prazdniny_do
+        name: Do (vrátane)
+      - entity: binary_sensor.plan_prazdniny
+        name: Prázdniny dnes
+      - type: section
+        label: Po–Pi platí profil Sviatok / prázdniny, TUV sa neblokuje, obeh TUV ako cez víkend.
+    - type: custom:plan-kurenia-card
+      mode: sviatky
+  - type: grid
+    cards:
+    - type: heading
+      heading: Dovolenka
+      icon: mdi:airplane
+    - type: entities
+      entities:
+      - entity: input_datetime.plan_dovolenka_od
+        name: Od
+      - entity: input_datetime.plan_dovolenka_do
+        name: Do (vrátane)
+      - entity: binary_sensor.plan_dovolenka
+        name: Dovolenka dnes
+      - type: section
+        label: Celý deň útlm, TUV z Daikinu vypnutá. Slnko (FVE) má prednosť.
+  - type: grid
+    cards:
+    - type: heading
+      heading: Nastavenia
+      icon: mdi:tune
+    - type: entities
+      state_color: true
+      entities:
+      - entity: input_boolean.daikin_plan_kurenia_aktivny
+        name: Plán aktívny
+      - entity: input_number.daikin_offset_normal
+        name: Normálny posun
+      - entity: input_number.daikin_utlm
+        name: Útlm (o koľko znížiť)
+      - entity: sensor.daikin_cielovy_posun_kurenia
+        name: Cieľ teraz
+      - entity: number.space_heating_temperature_control
+        name: Daikin — aktuálny posun
+      - type: divider
+      - entity: select.fve_diverter_rezim_kurenia
+        name: Režim kúrenia (FVE)
+      - entity: input_select.fve_daikin_pri_prebytku
+        name: Pri slnku (FVE)
+      - entity: switch.space_heating_climate_control
+        name: Kúrenie Daikin

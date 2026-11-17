@@ -1,0 +1,417 @@
+# ============================================================================
+# HA dashboard "FVE diverter" — PREVÁDZKA (ostrá verzia ESP, 2026-11-15)
+# url_path: fve-diverter (storage mode) — nahrané cez websocket
+# lovelace/config/save (scratchpad skript ha_dashboard.py, CFG/URL_PATH z env).
+# Servisný dashboard pre testovaciu verziu: fve_diverter_test.yaml.
+# 2026-11-16: relé (stykače, bypassy, čerpadlá, fany dosiek) len na zobrazenie
+# (binary_sensor — v ostrej verzii ESP sú relé internal), časový limit manuálu.
+# 2026-11-16 neskôr: okno FVE podľa východu/západu + slnečný deň, blokovanie TUV vo voľný deň;
+# karty Čerpadlo TUV / Čerpadlo podlaha s tvrdým režimom Auto / Trvalo ZAP / VYP.
+# ============================================================================
+title: FVE diverter
+views:
+  - title: Prevádzka
+    path: prevadzka
+    icon: mdi:solar-power-variant
+    type: sections
+    max_columns: 3
+    sections:
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "Regulácia"
+            icon: mdi:solar-power
+          - type: tile
+            entity: sensor.fve_diverter_okno_fve_dnes
+            name: Okno FVE dnes
+          - type: tile
+            entity: binary_sensor.fve_diverter_slnecny_den
+            name: Slnečný deň
+          - type: tile
+            entity: sensor.fve_diverter_zdroj_merania_prebytku
+            name: Zdroj merania
+          - type: tile
+            entity: sensor.fve_diverter_prebytok_dostupny
+            name: Prebytok
+          - type: tile
+            entity: sensor.fve_diverter_diverter_vykon_ciel
+            name: Výkon špirál (cieľ)
+          - type: tile
+            entity: sensor.fve_diverter_vykon_tuv
+            name: TUV
+          - type: tile
+            entity: sensor.fve_diverter_vykon_podlaha
+            name: Podlaha
+          - type: tile
+            entity: sensor.fve_diverter_pripojka_shelly_esp
+            name: Prípojka (Shelly)
+          - type: tile
+            entity: sensor.solax_cloud_realtime
+            name: Solax cloud — čas údaja
+          - type: tile
+            entity: sensor.fve_diverter_energia_do_tuv_dnes
+            name: Energia TUV dnes
+          - type: tile
+            entity: sensor.fve_diverter_energia_do_podlahy_dnes
+            name: Energia podlaha dnes
+          - type: tile
+            entity: sensor.fve_diverter_energia_do_tuv_daikin_k3m_dnes
+            name: TUV cez Daikin K3M dnes
+          - type: tile
+            entity: sensor.fve_diverter_energia_do_tuv_k3m_zo_siete_dnes
+            name: K3M zo siete dnes
+          - type: tile
+            entity: sensor.fve_diverter_energia_do_tuv_k3m_zo_slnka_dnes
+            name: K3M zo slnka dnes
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - entity: sensor.fve_diverter_regulacia_posledny_krok
+                name: Posledný krok
+              - entity: sensor.fve_diverter_regulacia_ciel_podla_solaxu
+                name: Cieľ podľa Solaxu
+              - entity: sensor.fve_diverter_solax_cloud_vek_udaja
+                name: Vek údaja zo Solaxu
+              - entity: binary_sensor.fve_diverter_ohrev_podlahy_z_fve
+                name: Ohrev podlahy z FVE
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "Teploty a voda"
+            icon: mdi:thermometer
+          - type: tile
+            entity: sensor.fve_diverter_teplota_tuv_bojler
+            name: TUV bojler
+          - type: tile
+            entity: sensor.fve_diverter_teplota_vratna_voda_tuv
+            name: Vratná TUV
+          - type: tile
+            entity: sensor.fve_diverter_teplota_voda_podlaha
+            name: Voda podlaha
+          - type: tile
+            entity: sensor.fve_diverter_tepla_voda_odber
+            name: Teplá voda — odber
+          - type: history-graph
+            title: Teploty (24 h)
+            hours_to_show: 24
+            entities:
+              - entity: sensor.fve_diverter_teplota_tuv_bojler
+                name: TUV bojler
+              - entity: sensor.fve_diverter_teplota_vratna_voda_tuv
+                name: Vratná
+              - entity: sensor.fve_diverter_teplota_voda_podlaha
+                name: Podlaha
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "Spotrebiče"
+            icon: mdi:electric-switch
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - entity: light.fve_diverter_dimmer_tuv
+                name: Dimmer TUV
+              - entity: binary_sensor.fve_diverter_stykac_tuv_cievka
+                name: Stykač TUV
+              - entity: binary_sensor.fve_diverter_bypass_stykac_tuv_cievka
+                name: Bypass TUV
+              - entity: light.fve_diverter_dimmer_podlaha
+                name: Dimmer podlaha
+              - entity: binary_sensor.fve_diverter_stykac_podlaha_cievka
+                name: Stykač podlaha
+              - entity: binary_sensor.fve_diverter_bypass_stykac_podlaha_cievka
+                name: Bypass podlaha
+              - type: divider
+              - entity: binary_sensor.fve_diverter_cerpadlo_tuv
+                name: Čerpadlo TUV
+              - entity: sensor.fve_diverter_cerpadlo_tuv_dovod
+                name: Čerpadlo TUV — dôvod
+              - entity: binary_sensor.fve_diverter_cerpadlo_podlaha
+                name: Čerpadlo podlaha
+              - type: divider
+              - entity: sensor.fve_diverter_ventilator_skrine_vykon
+                name: Ventilátor skrine
+              - entity: sensor.fve_diverter_ventilator_skrine_otacky
+                name: Ventilátor skrine — otáčky
+              - entity: binary_sensor.fve_diverter_fan_triac_tuv_dimmer_doska
+                name: Fan dosky TUV
+              - entity: binary_sensor.fve_diverter_fan_triac_podlaha_dimmer_doska
+                name: Fan dosky podlaha
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        column_span: 3
+        cards:
+          - type: heading
+            heading: "Výkon (24 h)"
+            icon: mdi:chart-line
+          - type: history-graph
+            hours_to_show: 24
+            grid_options:
+              columns: full
+            entities:
+              - entity: sensor.fve_diverter_prebytok_dostupny
+                name: Prebytok
+              - entity: sensor.fve_diverter_diverter_vykon_ciel
+                name: Špirály (cieľ)
+              - entity: sensor.fve_diverter_pripojka_shelly_esp
+                name: Prípojka Shelly
+              - entity: sensor.solax_bateria_vykon
+                name: Batéria (Solax)
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "Energia do špirál (odhad)"
+            icon: mdi:lightning-bolt
+          - type: entities
+            show_header_toggle: false
+            title: TUV — špirála
+            entities:
+              - entity: sensor.fve_diverter_energia_do_tuv_dnes
+                name: Dnes
+              - entity: sensor.fve_energia_do_tuv_tyzden
+                name: Týždeň
+              - entity: sensor.fve_energia_do_tuv_mesiac
+                name: Mesiac
+          - type: entities
+            show_header_toggle: false
+            title: Podlaha
+            entities:
+              - entity: sensor.fve_diverter_energia_do_podlahy_dnes
+                name: Dnes
+              - entity: sensor.fve_energia_do_podlahy_tyzden
+                name: Týždeň
+              - entity: sensor.fve_energia_do_podlahy_mesiac
+                name: Mesiac
+          - type: entities
+            show_header_toggle: false
+            title: TUV cez Daikin K3M (spolu)
+            entities:
+              - entity: sensor.fve_diverter_energia_do_tuv_daikin_k3m_dnes
+                name: Dnes
+              - entity: sensor.energia_do_tuv_cez_daikin_k3m_tyzden
+                name: Týždeň
+              - entity: sensor.energia_do_tuv_cez_daikin_k3m_mesiac
+                name: Mesiac
+          # K3M rozdelené podľa Shelly (2026-11-16): zo siete = odber zo siete v tej chvíli
+          # (najviac výkon špirály), zo slnka = zvyšok. Batériu nevidíme → jej podiel je v „zo slnka“.
+          - type: entities
+            show_header_toggle: false
+            title: K3M zo siete
+            entities:
+              - entity: sensor.fve_diverter_energia_do_tuv_k3m_zo_siete_dnes
+                name: Dnes
+              - entity: sensor.fve_diverter_energia_do_tuv_cez_k3m_zo_siete_tyzden
+                name: Týždeň
+              - entity: sensor.fve_diverter_energia_do_tuv_cez_k3m_zo_siete_mesiac
+                name: Mesiac
+          - type: entities
+            show_header_toggle: false
+            title: K3M zo slnka (vrátane batérie)
+            entities:
+              - entity: sensor.fve_diverter_energia_do_tuv_k3m_zo_slnka_dnes
+                name: Dnes
+              - entity: sensor.fve_diverter_energia_do_tuv_cez_k3m_zo_slnka_tyzden
+                name: Týždeň
+              - entity: sensor.fve_diverter_energia_do_tuv_cez_k3m_zo_slnka_mesiac
+                name: Mesiac
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "Daikin a stratégia"
+            icon: mdi:heat-pump
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - entity: binary_sensor.fve_diverter_daikin_ziada_ohrev_tuv_bojler
+                name: Daikin žiada ohrev TUV (K3M)
+              - entity: binary_sensor.fve_diverter_daikin_ziada_cerpadlo_podlahy
+                name: Daikin žiada čerpadlo podlahy
+              - entity: water_heater.hot_water_tank_domestic_hot_water_tank
+                name: Daikin TUV
+              - entity: input_boolean.fve_tuv_blokovane
+                name: Daikin TUV zablokovaná (slnko)
+              - entity: switch.space_heating_climate_control
+                name: Daikin kúrenie
+              - entity: number.space_heating_temperature_control
+                name: Daikin posun teploty vody
+              - entity: binary_sensor.fve_slnko_pre_daikin
+                name: Slnko pre Daikin
+              - entity: input_boolean.fve_daikin_slnko_aktivne
+                name: Daikin slnečný režim aktívny
+              - entity: input_boolean.fve_tech_zvysene
+                name: Tech M-9R zóny zvýšené
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "Nastavenia"
+            icon: mdi:tune
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - entity: select.fve_diverter_rezim_kurenia
+                name: Režim kúrenia
+              - entity: number.fve_diverter_max_teplota_tuv
+                name: Max TUV
+              - entity: number.fve_diverter_max_teplota_voda_podlaha
+                name: Max voda podlaha
+              - entity: number.fve_diverter_podiel_prebytku_do_baterie
+                name: Podiel do batérie
+              - entity: number.fve_diverter_soc_baterie_povazovana_za_plnu
+                name: SoC = plná
+              - entity: number.fve_diverter_tuv_manualny_vykon_0_auto
+                name: TUV manuálny výkon (0 = auto)
+              - entity: number.fve_diverter_podlaha_manualny_vykon_0_auto
+                name: Podlaha manuálny výkon (0 = auto)
+              - entity: number.fve_diverter_manualny_vykon_casovy_limit
+                name: Manuálny výkon — časový limit
+              - entity: sensor.fve_diverter_tuv_manual_zostava
+                name: TUV manuál — zostáva
+              - entity: sensor.fve_diverter_podlaha_manual_zostava
+                name: Podlaha manuál — zostáva
+              - entity: number.fve_diverter_okno_fve_zaciatok_po_vychode
+                name: Okno FVE — začiatok po východe
+              - entity: number.fve_diverter_okno_fve_koniec_pred_zapadom
+                name: Okno FVE — koniec pred západom
+              - entity: number.fve_diverter_slnecny_den_prah_prebytku
+                name: Slnečný deň — prah prebytku
+              - entity: number.fve_diverter_slnecny_den_trvanie_prebytku
+                name: Slnečný deň — trvanie prebytku
+          # Režim čerpadiel (2026-11-16): VYP / Trvalo ZAP = TVRDÉ, bez ohľadu na čokoľvek
+          # (servis, zapájanie). Auto = podľa automatiky.
+          - type: entities
+            show_header_toggle: false
+            title: Čerpadlo TUV
+            entities:
+              - entity: select.fve_diverter_cerpadlo_tuv_rezim
+                name: Režim (VYP = tvrdo vypnuté)
+              - entity: binary_sensor.fve_diverter_cerpadlo_tuv
+                name: Beží
+              - entity: sensor.fve_diverter_cerpadlo_tuv_dovod
+                name: Dôvod
+              - type: divider
+              - entity: switch.fve_diverter_cerpadlo_tuv_pocas_ohrevu
+                name: Počas ohrevu
+              - entity: input_boolean.fve_cerpadlo_tuv_doma_auto
+                name: Počas ohrevu — automaticky keď sme doma
+              - entity: number.fve_diverter_cerpadlo_tuv_prah_rozdielu_pri_odbere_bojler_vratna
+                name: Prah pri odbere
+              - entity: number.fve_diverter_cerpadlo_tuv_dlzka_behu_po_odbere
+                name: Beh po odbere
+              - entity: number.fve_diverter_cerpadlo_tuv_prah_rozdielu_pre_udrzbu_bojler_vratna
+                name: Prah údržby
+              - entity: number.fve_diverter_cerpadlo_tuv_auto_od_teploty_slnko
+                name: Auto od teploty (slnko)
+          - type: entities
+            show_header_toggle: false
+            title: Čerpadlo podlaha
+            entities:
+              - entity: select.fve_diverter_cerpadlo_podlaha_rezim
+                name: Režim (VYP = tvrdo vypnuté)
+              - entity: binary_sensor.fve_diverter_cerpadlo_podlaha
+                name: Beží
+              - entity: binary_sensor.fve_diverter_daikin_ziada_cerpadlo_podlahy
+                name: Daikin žiada čerpadlo
+          - type: entities
+            show_header_toggle: false
+            title: Ladenie regulácie
+            entities:
+              - entity: number.fve_diverter_ladenie_zisk_shelly
+                name: Zisk Shelly
+              - entity: number.fve_diverter_ladenie_krok_zo_solaxu
+                name: Krok zo Solaxu
+              - entity: number.fve_diverter_ladenie_max_pridanie_zo_solaxu
+                name: Max pridanie zo Solaxu
+              - entity: number.fve_diverter_ladenie_rezerva_baterie
+                name: Rezerva batérie
+              - entity: number.fve_diverter_ladenie_prah_odberu_brzda
+                name: Prah odberu (brzda)
+              - entity: number.fve_diverter_ladenie_prah_pretoku_plyn
+                name: Prah pretoku (plyn)
+              - entity: number.fve_diverter_ladenie_pretok_v_nudzovom_rezime
+                name: Pretok v núdzovom režime
+              - entity: number.fve_diverter_vykon_spiraly_tuv
+                name: Výkon špirály TUV
+              - entity: number.fve_diverter_vykon_spiraly_podlaha
+                name: Výkon špirály podlaha
+          - type: entities
+            show_header_toggle: false
+            title: Stratégia (HA)
+            entities:
+              - entity: input_select.fve_daikin_pri_prebytku
+                name: Daikin kúrenie pri prebytku
+              - entity: input_number.fve_daikin_prebytok_zap_w
+                name: Slnko — prah zapnutia (Daikin dole)
+              - entity: input_number.fve_daikin_prebytok_vyp_w
+                name: Slnko — prah ukončenia
+              - entity: input_number.fve_daikin_offset_slnko
+                name: Posun teploty cez slnko
+              - entity: input_boolean.fve_tuv_blokovat_pracovny_den
+                name: Blokovať Daikin TUV v pracovný deň
+              - entity: input_datetime.fve_tuv_blok_od
+                name: Blokovanie od
+              - entity: input_datetime.fve_tuv_blok_do
+                name: Blokovanie do
+              - entity: input_boolean.fve_tuv_blokovat_volny_den
+                name: Voľný deň — blokovať TUV, čakať na slnko
+              - entity: input_number.fve_tuv_volny_den_cakat_min
+                name: Voľný deň — čakať na slnko
+              - entity: input_boolean.fve_tuv_rucne_dnes
+                name: Ručný performance dnes (neblokovať)
+              - entity: input_boolean.fve_prazdniny
+                name: Prázdniny (deti doma)
+              - entity: input_boolean.fve_tech_spalna_spolu
+                name: Tech — zvyšovať aj spálňu
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "Diagnostika"
+            icon: mdi:stethoscope
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - entity: sensor.fve_diverter_dimmerlink_tuv_uroven
+                name: DimmerLink TUV — úroveň (spätne)
+              - entity: binary_sensor.fve_diverter_dimmerlink_tuv_chyba
+                name: DimmerLink TUV — chyba
+              - entity: sensor.fve_diverter_dimmerlink_podlaha_uroven
+                name: DimmerLink podlaha — úroveň (spätne)
+              - entity: binary_sensor.fve_diverter_dimmerlink_podlaha_chyba
+                name: DimmerLink podlaha — chyba
+              - entity: binary_sensor.fve_diverter_esp_pripojene
+                name: ESP pripojené
+              - entity: sensor.fve_diverter_wifi_signal
+                name: WiFi signál
+              - entity: sensor.fve_diverter_cas_od_zapnutia
+                name: Čas od zapnutia
+              - entity: button.fve_diverter_restart_esp
+                name: Reštart ESP
+          - type: entities
+            show_header_toggle: false
+            title: Počty zopnutí
+            entities:
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_tuv
+                name: Stykač TUV
+              - entity: sensor.fve_diverter_pocet_zopnuti_bypass_tuv
+                name: Bypass TUV
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_podlaha
+                name: Stykač podlaha
+              - entity: sensor.fve_diverter_pocet_zopnuti_bypass_podlaha
+                name: Bypass podlaha
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_obeh_tuv
+                name: Čerpadlo TUV
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_obeh_podlaha
+                name: Čerpadlo podlaha

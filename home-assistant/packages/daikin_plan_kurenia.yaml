@@ -1,0 +1,281 @@
+# ============================================================================
+# DAIKIN — PLÁN KÚRENIA (normál / útlm podľa týždenného rozvrhu)
+# ============================================================================
+# 2026-11-16, v3. Kúrenie ostáva zapnuté, plán mení len POSUN TEPLOTY VODY
+# (number.space_heating_temperature_control, ekvitermická krivka, −10..+10, krok 1
+# — lokálna integrácia daikin_altherma, LAN adaptér Daikin).
+#
+# Rozvrhy = UI pomocníci (nie YAML), upravujú sa v karte custom:plan-kurenia-card
+# (dashboard "Plán kúrenia", /config/www/plan-kurenia-card.js). Blok = NORMÁL,
+# mimo bloku = ÚTLM.
+#   schedule.daikin_plan_tyzden   — Po..Ne, každý deň vlastné bloky
+#   schedule.daikin_plan_sviatok  — profil "Sviatok / prázdniny" (všetkých 7 dní
+#                                   rovnako; karta ukladá do všetkých dní)
+# Ktorý profil platí v daný deň:
+#   dovolenka (dátumy od–do)                      → celý deň útlm (aj keď je plán
+#                                                    neaktívny); TUV vypnutá (fve_strategia)
+#   Po–Pi a sviatok (Workday SK) alebo prázdniny  → profil Sviatok
+#   inak                                          → týždenný rozvrh pre ten deň
+#
+# Cieľový posun (sensor.daikin_cielovy_posun_kurenia) — jediný zdroj pravdy:
+#   1. slnko (FVE stratégia, voľba "Znížiť") → nižšia z hodnôt slnko / plán
+#   2. dovolenka, alebo plán aktívny + "Kúrenie zapnuté" + mimo bloku → normál − útlm
+#   3. inak → normál
+# Aplikuje ho script.fve_daikin_aplikuj (packages/fve_strategia.yaml).
+#
+# Normál = input_number.daikin_offset_normal. Ručná zmena posunu (na Daikine
+# alebo v HA) počas normálu sa po 2 min ustálenia prevezme ako nový normál.
+# Ručná zmena počas útlmu/slnka platí len do najbližšej zmeny cieľa.
+#
+# sensor.plan_kurenia_prehlad: najbližšia zmena (stav) + rozpis dní od pondelka
+# tohto týždňa na 14 dní (profil + bloky) pre kartu. Sviatky z kalendára
+# calendar.workday_sensor_sk_kalendar (udalosť = pracovný deň). Zrušenie / pridanie
+# sviatku = nastavenia integrácie Workday (remove_holidays / add_holidays), robí to
+# karta „Sviatky“ (mode: sviatky) — zoznam z calendar.slovensko (integrácia Sviatky).
+# ============================================================================
+input_boolean:
+  daikin_plan_kurenia_aktivny:
+    name: "Plán kúrenia — aktívny"
+    icon: mdi:calendar-clock
+
+input_number:
+  daikin_offset_normal:
+    name: "Plán kúrenia — normálny posun"
+    min: -10
+    max: 10
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer
+  daikin_utlm:
+    name: "Plán kúrenia — útlm"
+    min: 0
+    max: 10
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-minus
+  daikin_offset_posledny_ciel:
+    name: "Plán kúrenia — posledný posun nastavený automatikou (interné)"
+    min: -10
+    max: 10
+    step: 1
+    unit_of_measurement: "°C"
+
+input_datetime:
+  plan_prazdniny_od:
+    name: "Prázdniny od"
+    has_date: true
+    has_time: false
+    icon: mdi:school-outline
+  plan_prazdniny_do:
+    name: "Prázdniny do"
+    has_date: true
+    has_time: false
+    icon: mdi:school-outline
+  plan_dovolenka_od:
+    name: "Dovolenka od"
+    has_date: true
+    has_time: false
+    icon: mdi:airplane-takeoff
+  plan_dovolenka_do:
+    name: "Dovolenka do"
+    has_date: true
+    has_time: false
+    icon: mdi:airplane-landing
+
+template:
+  - binary_sensor:
+      - name: "Plán prázdniny"
+        unique_id: plan_prazdniny
+        icon: mdi:school-outline
+        state: >
+          {% set od = states('input_datetime.plan_prazdniny_od') %}
+          {% set do = states('input_datetime.plan_prazdniny_do') %}
+          {% set d = now().date() | string %}
+          {{ od | length == 10 and do | length == 10 and od <= d <= do }}
+      - name: "Plán dovolenka"
+        unique_id: plan_dovolenka
+        icon: mdi:airplane
+        state: >
+          {% set od = states('input_datetime.plan_dovolenka_od') %}
+          {% set do = states('input_datetime.plan_dovolenka_do') %}
+          {% set d = now().date() | string %}
+          {{ od | length == 10 and do | length == 10 and od <= d <= do }}
+      - name: "Daikin plán kúrenia normál"
+        unique_id: daikin_plan_kurenia_normal
+        icon: mdi:radiator
+        state: >
+          {% if is_state('binary_sensor.plan_dovolenka', 'on') %}false
+          {% elif now().weekday() < 5 and (is_state('binary_sensor.workday_sensor_sk', 'off')
+                                          or is_state('binary_sensor.plan_prazdniny', 'on')) %}
+            {{ is_state('schedule.daikin_plan_sviatok', 'on') }}
+          {% else %}{{ is_state('schedule.daikin_plan_tyzden', 'on') }}{% endif %}
+        attributes:
+          profil: >
+            {% if is_state('binary_sensor.plan_dovolenka', 'on') %}dovolenka
+            {%- elif now().weekday() < 5 and is_state('binary_sensor.plan_prazdniny', 'on') %}prázdniny
+            {%- elif now().weekday() < 5 and is_state('binary_sensor.workday_sensor_sk', 'off') %}sviatok
+            {%- else %}týždeň{% endif %}
+  - sensor:
+      - name: "Daikin cieľový posun kúrenia"
+        unique_id: daikin_cielovy_posun_kurenia
+        unit_of_measurement: "°C"
+        icon: mdi:thermometer-auto
+        # Počas reloadu šablón (vstupy unavailable) radšej nedostupné, inak by
+        # script.fve_daikin_aplikuj na chvíľu nastavil normál.
+        availability: >
+          {{ states('binary_sensor.daikin_plan_kurenia_normal') in ['on', 'off']
+             and has_value('input_number.daikin_offset_normal')
+             and has_value('input_number.daikin_utlm')
+             and states('binary_sensor.plan_dovolenka') in ['on', 'off'] }}
+        state: >
+          {% set norm = states('input_number.daikin_offset_normal') | int(0) %}
+          {% set utlm = [norm - states('input_number.daikin_utlm') | int(5), -10] | max %}
+          {% set plan = is_state('input_boolean.daikin_plan_kurenia_aktivny', 'on')
+                        and is_state('select.fve_diverter_rezim_kurenia', 'Kúrenie zapnuté') %}
+          {% set planovany = utlm if is_state('binary_sensor.plan_dovolenka', 'on')
+                                     or (plan and is_state('binary_sensor.daikin_plan_kurenia_normal', 'off'))
+                             else norm %}
+          {% set slnko = is_state('input_boolean.fve_daikin_slnko_aktivne', 'on')
+                         and is_state('input_select.fve_daikin_pri_prebytku', 'Znížiť (−10 °C)') %}
+          {{ [planovany, states('input_number.fve_daikin_offset_slnko') | int(-10)] | min if slnko else planovany }}
+        attributes:
+          dovod: >
+            {% set plan = is_state('input_boolean.daikin_plan_kurenia_aktivny', 'on')
+                          and is_state('select.fve_diverter_rezim_kurenia', 'Kúrenie zapnuté') %}
+            {% if is_state('input_boolean.fve_daikin_slnko_aktivne', 'on')
+                  and is_state('input_select.fve_daikin_pri_prebytku', 'Znížiť (−10 °C)') %}slnko (FVE)
+            {%- elif is_state('binary_sensor.plan_dovolenka', 'on') %}dovolenka (útlm)
+            {%- elif not plan %}normál (plán neaktívny)
+            {%- elif is_state('binary_sensor.daikin_plan_kurenia_normal', 'on') %}normál
+            {%- else %}útlm{% endif %}
+
+  # Prehľad pre kartu + najbližšia zmena plánu (normál ↔ útlm).
+  - trigger:
+      - trigger: time_pattern
+        minutes: "/15"
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+      # karta Sviatky po zmene sviatku v nastaveniach Workday
+      - trigger: event
+        event_type: plan_kurenia_refresh
+      - trigger: state
+        entity_id:
+          - schedule.daikin_plan_tyzden
+          - schedule.daikin_plan_sviatok
+          - binary_sensor.daikin_plan_kurenia_normal
+          - input_datetime.plan_prazdniny_od
+          - input_datetime.plan_prazdniny_do
+          - input_datetime.plan_dovolenka_od
+          - input_datetime.plan_dovolenka_do
+          - binary_sensor.workday_sensor_sk
+    actions:
+      - action: schedule.get_schedule
+        target:
+          entity_id: [schedule.daikin_plan_tyzden, schedule.daikin_plan_sviatok]
+        response_variable: sch
+      - variables:
+          pondelok: "{{ (today_at() - timedelta(days=now().weekday())).isoformat() }}"
+      - action: calendar.get_events
+        target: { entity_id: calendar.workday_sensor_sk_kalendar }
+        data:
+          start_date_time: "{{ pondelok }}"
+          duration: { days: 15 }
+        response_variable: kal
+      - variables:
+          dni: >
+            {% set mena = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+            {% set prac = kal['calendar.workday_sensor_sk_kalendar'].events | map(attribute='start') | list %}
+            {% set ty = sch['schedule.daikin_plan_tyzden'] %}
+            {% set sv = sch['schedule.daikin_plan_sviatok'] %}
+            {% set p_od = states('input_datetime.plan_prazdniny_od') %}{% set p_do = states('input_datetime.plan_prazdniny_do') %}
+            {% set d_od = states('input_datetime.plan_dovolenka_od') %}{% set d_do = states('input_datetime.plan_dovolenka_do') %}
+            {% set ns = namespace(out=[]) %}
+            {% for i in range(14) %}
+              {% set dt = as_datetime(pondelok) + timedelta(days=i) %}
+              {% set ds = dt.date() | string %}{% set wd = dt.weekday() %}
+              {% set sviatok = wd < 5 and ds not in prac %}
+              {% set prazdniny = p_od | length == 10 and p_do | length == 10 and p_od <= ds <= p_do %}
+              {% set dovolenka = d_od | length == 10 and d_do | length == 10 and d_od <= ds <= d_do %}
+              {% if dovolenka %}{% set prof = 'dovolenka' %}{% set bl = [] %}
+              {% elif wd < 5 and prazdniny %}{% set prof = 'prázdniny' %}{% set bl = sv[mena[wd]] %}
+              {% elif sviatok %}{% set prof = 'sviatok' %}{% set bl = sv[mena[wd]] %}
+              {% else %}{% set prof = 'týždeň' %}{% set bl = ty[mena[wd]] %}{% endif %}
+              {% set nb = namespace(b=[]) %}
+              {% for x in bl %}{% set nb.b = nb.b + [[(x['from'] | string)[:5], (x['to'] | string)[:5]]] %}{% endfor %}
+              {% set ns.out = ns.out + [{'datum': ds, 'den': wd, 'profil': prof, 'sviatok': sviatok,
+                   'prazdniny': prazdniny, 'dovolenka': dovolenka, 'bloky': nb.b}] %}
+            {% endfor %}
+            {{ ns.out }}
+      - variables:
+          profily: >
+            {% set mena = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+            {% set ns = namespace(ty=[], sv=[]) %}
+            {% for m in mena %}
+              {% set nb = namespace(b=[]) %}
+              {% for x in sch['schedule.daikin_plan_tyzden'][m] %}{% set nb.b = nb.b + [[(x['from'] | string)[:5], (x['to'] | string)[:5]]] %}{% endfor %}
+              {% set ns.ty = ns.ty + [nb.b] %}
+            {% endfor %}
+            {% for x in sch['schedule.daikin_plan_sviatok']['monday'] %}{% set ns.sv = ns.sv + [[(x['from'] | string)[:5], (x['to'] | string)[:5]]] %}{% endfor %}
+            {{ {'tyzden': ns.ty, 'sviatok': ns.sv} }}
+          zmena: >
+            {% set ns = namespace(hr=[], stav=none, best=none, best_stav=none) %}
+            {% for d in dni %}
+              {% for b in d.bloky %}
+                {% set z = as_datetime(d.datum ~ 'T' ~ b[0] ~ ':00').replace(tzinfo=now().tzinfo) %}
+                {% set k = as_datetime(d.datum ~ 'T00:00:00').replace(tzinfo=now().tzinfo) + timedelta(days=1)
+                           if b[1] >= '23:59' else as_datetime(d.datum ~ 'T' ~ b[1] ~ ':00').replace(tzinfo=now().tzinfo) %}
+                {% set ns.hr = ns.hr + [[z, k]] %}
+              {% endfor %}
+            {% endfor %}
+            {% set ns.stav = ns.hr | selectattr(0, 'le', now()) | selectattr(1, 'gt', now()) | list | count > 0 %}
+            {% set hrany = (ns.hr | map(attribute=0) | list + ns.hr | map(attribute=1) | list) | select('gt', now()) | unique | sort %}
+            {% for h in hrany %}
+              {% if ns.best is none %}
+                {% set t = h + timedelta(seconds=1) %}
+                {% set s = ns.hr | selectattr(0, 'le', t) | selectattr(1, 'gt', t) | list | count > 0 %}
+                {% if s != ns.stav %}{% set ns.best = h %}{% set ns.best_stav = s %}{% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ {'kedy': ns.best.isoformat() if ns.best else none,
+                'na': ('normál' if ns.best_stav else 'útlm') if ns.best else none,
+                'teraz': 'normál' if ns.stav else 'útlm'} }}
+    sensor:
+      - name: "Plán kúrenia prehľad"
+        unique_id: plan_kurenia_prehlad
+        icon: mdi:calendar-clock
+        device_class: timestamp
+        state: "{{ zmena.kedy }}"
+        attributes:
+          dalsi_stav: "{{ zmena.na }}"
+          podla_planu_teraz: "{{ zmena.teraz }}"
+          dni: "{{ dni }}"
+          profil_tyzden: "{{ profily.tyzden }}"
+          profil_sviatok: "{{ profily.sviatok }}"
+          prazdniny: "{{ [states('input_datetime.plan_prazdniny_od'), states('input_datetime.plan_prazdniny_do')] }}"
+          dovolenka: "{{ [states('input_datetime.plan_dovolenka_od'), states('input_datetime.plan_dovolenka_do')] }}"
+
+automation:
+  - id: daikin_plan_rucna_zmena_posunu
+    alias: "Daikin — plán kúrenia: ručná zmena posunu = nový normál"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: number.space_heating_temperature_control
+        not_to: ["unavailable", "unknown"]
+        for: { minutes: 2 }
+    conditions:
+      - condition: template
+        value_template: >
+          {{ (states('number.space_heating_temperature_control') | int(-99)) != -99
+             and (states('number.space_heating_temperature_control') | int(-99))
+                 != (states('input_number.daikin_offset_posledny_ciel') | int(-99))
+             and state_attr('sensor.daikin_cielovy_posun_kurenia', 'dovod') in ['normál', 'normál (plán neaktívny)'] }}
+    actions:
+      - action: input_number.set_value
+        target: { entity_id: input_number.daikin_offset_posledny_ciel }
+        data: { value: "{{ states('number.space_heating_temperature_control') | int }}" }
+      - action: input_number.set_value
+        target: { entity_id: input_number.daikin_offset_normal }
+        data: { value: "{{ states('number.space_heating_temperature_control') | int }}" }

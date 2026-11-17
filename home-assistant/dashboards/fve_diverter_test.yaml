@@ -1,0 +1,292 @@
+# ============================================================================
+# HA dashboard "FVE diverter — test" — oživenie HW s testovacou verziou ESP
+# (esp32-fve-diverter/fve-diverter-test.yaml). Návrh 2026-11-09.
+# ⚠️ ZATIAĽ NEVYTVORENÝ v HA — vytvorí sa po flashi testovacej verzie a pridaní
+#    ESP do HA (ESPHome integrácia): websocket lovelace/dashboards/create
+#    (url_path "fve-diverter-test", mode storage) + lovelace/config/save s
+#    týmto obsahom (YAML → JSON).
+# Entity ID odvodené z mien v YAML cez HA slugify ("FVE diverter <meno>") —
+# po pridaní ESP do HA overiť, že sedia.
+# Poradie sekcií = poradie testovania: 1) relé → stykače, adresy DimmerLink
+# a DS18B20 (BEZ záťaže); 2) až potom špirály.
+# ============================================================================
+title: FVE diverter — test
+views:
+  - title: Test HW
+    path: test
+    icon: mdi:test-tube
+    type: sections
+    max_columns: 4
+    sections:
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "1 · Relé → stykače (bez záťaže)"
+            icon: mdi:electric-switch
+          - type: markdown
+            content: >-
+              Každé pomocné relé zapni a over, že cvakne **správny veľký
+              stykač**. Po reštarte ESP nesmie nič cvaknúť (bezpečný default VYP).
+              Auto-vypnutie stykačov/bypassov/dimmerov po nastavenom čase
+              (sekcia 8).
+          - type: tile
+            entity: switch.fve_diverter_stykac_tuv_cievka
+            name: Stykač TUV (izolačný)
+            tap_action: { action: toggle }
+          - type: tile
+            entity: switch.fve_diverter_bypass_stykac_tuv_cievka
+            name: Bypass TUV
+            tap_action: { action: toggle }
+          - type: tile
+            entity: switch.fve_diverter_stykac_podlaha_cievka
+            name: Stykač podlaha (izolačný)
+            tap_action: { action: toggle }
+          - type: tile
+            entity: switch.fve_diverter_bypass_stykac_podlaha_cievka
+            name: Bypass podlaha
+            tap_action: { action: toggle }
+          - type: tile
+            entity: switch.fve_diverter_cerpadlo_tuv
+            name: Čerpadlo TUV (obeh)
+            tap_action: { action: toggle }
+          - type: tile
+            entity: switch.fve_diverter_cerpadlo_podlaha
+            name: Čerpadlo podlaha (beží)
+            tap_action: { action: more-info }
+          - type: tile
+            entity: select.fve_diverter_cerpadlo_podlaha_rezim
+            name: Čerpadlo podlaha — režim
+            features:
+              - type: select-options
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "2 · DimmerLink — adresy a stav"
+            icon: mdi:expansion-card
+          - type: markdown
+            content: >-
+              Očakávané I2C: **0x50** (TUV) a **0x51** (podlaha). Oba moduly majú
+              z výroby 0x50 → modul pre podlahu pripoj **SÁM** a stlač
+              „zmeniť adresu 0x50 → 0x51“, až potom spoj oba na zbernicu.
+          - type: entities
+            entities:
+              - entity: sensor.fve_diverter_test_i2c_zariadenia
+                name: Nájdené I2C adresy
+              - entity: button.fve_diverter_test_i2c_scan
+                name: I2C scan
+              - entity: button.fve_diverter_dimmerlink_zmenit_adresu_0x50_0x51_len_1_modul_na_zbernici
+                name: "⚠️ Zmeniť adresu 0x50 → 0x51 (len 1 modul!)"
+          - type: entities
+            title: DimmerLink TUV (0x50)
+            entities:
+              - entity: binary_sensor.fve_diverter_dimmerlink_tuv_pripraveny
+                name: Pripravený
+              - entity: binary_sensor.fve_diverter_dimmerlink_tuv_chyba
+                name: Chyba
+              - entity: binary_sensor.fve_diverter_dimmerlink_tuv_kalibracia_hotova
+                name: Kalibrácia hotová
+              - entity: sensor.fve_diverter_dimmerlink_tuv_frekvencia_siete
+                name: Frekvencia siete
+              - entity: sensor.fve_diverter_dimmerlink_tuv_perioda
+                name: Perióda
+              - entity: sensor.fve_diverter_dimmerlink_tuv_uroven
+                name: Úroveň
+              - entity: sensor.fve_diverter_dimmerlink_tuv_firmver
+                name: Firmvér
+              - entity: select.fve_diverter_dimmerlink_tuv_krivka
+                name: Krivka
+              - entity: button.fve_diverter_dimmerlink_tuv_reset
+                name: Reset
+              - entity: button.fve_diverter_dimmerlink_tuv_rekalibracia
+                name: Rekalibrácia
+          - type: entities
+            title: DimmerLink podlaha (0x51)
+            entities:
+              - entity: binary_sensor.fve_diverter_dimmerlink_podlaha_pripraveny
+                name: Pripravený
+              - entity: binary_sensor.fve_diverter_dimmerlink_podlaha_chyba
+                name: Chyba
+              - entity: binary_sensor.fve_diverter_dimmerlink_podlaha_kalibracia_hotova
+                name: Kalibrácia hotová
+              - entity: sensor.fve_diverter_dimmerlink_podlaha_frekvencia_siete
+                name: Frekvencia siete
+              - entity: sensor.fve_diverter_dimmerlink_podlaha_perioda
+                name: Perióda
+              - entity: sensor.fve_diverter_dimmerlink_podlaha_uroven
+                name: Úroveň
+              - entity: sensor.fve_diverter_dimmerlink_podlaha_firmver
+                name: Firmvér
+              - entity: select.fve_diverter_dimmerlink_podlaha_krivka
+                name: Krivka
+              - entity: button.fve_diverter_dimmerlink_podlaha_reset
+                name: Reset
+              - entity: button.fve_diverter_dimmerlink_podlaha_rekalibracia
+                name: Rekalibrácia
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "3 · Teploty DS18B20"
+            icon: mdi:thermometer
+          - type: markdown
+            content: >-
+              Každý DS18B20 na vlastnom pine: bojler G21, vratná G5, podlaha
+              G13 (adresy zapísané 2026-11-15). „Hľadať DS18B20“ ukáže, čo je
+              na ktorom pine. Teplá voda — odber: **ide** = niekto púšťa teplú
+              vodu (pulzy prietokomera), **nejde** = 10 s bez pulzov.
+          - type: entities
+            entities:
+              - entity: sensor.fve_diverter_test_ds18b20_adresy
+                name: Nájdené adresy
+              - entity: button.fve_diverter_test_hladat_ds18b20
+                name: Hľadať DS18B20
+              - entity: sensor.fve_diverter_teplota_tuv_bojler
+                name: TUV bojler
+              - entity: sensor.fve_diverter_teplota_vratna_voda_tuv
+                name: Vratná voda TUV
+              - entity: sensor.fve_diverter_teplota_voda_podlaha
+                name: Voda podlaha
+              - entity: sensor.fve_diverter_tepla_voda_odber
+                name: Teplá voda — odber (prietokomer G4)
+              - entity: number.fve_diverter_max_teplota_tuv
+                name: Max TUV (tepelná poistka)
+              - entity: number.fve_diverter_max_teplota_voda_podlaha
+                name: Max podlaha (tepelná poistka)
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "4 · Dimmery (až so záťažou)"
+            icon: mdi:heating-coil
+          - type: markdown
+            content: >-
+              Až po overení sekcie 1–3. Bypass zapínaj **až keď je dimmer na
+              100 %** (TRIAC prevezme prúd, stykač nespína naplno), vypínaj
+              najprv bypass, potom dimmer. Porovnaj krivky LINEAR vs. RMS
+              (klieštový ampérmeter).
+          - type: tile
+            entity: light.fve_diverter_dimmer_tuv
+            name: Dimmer TUV (3 kW)
+            features:
+              - type: light-brightness
+          - type: tile
+            entity: light.fve_diverter_dimmer_podlaha
+            name: Dimmer podlaha (600 W)
+            features:
+              - type: light-brightness
+          - type: entities
+            title: Dosky dimmerov (surové napätie, kalibrácia)
+            entities:
+              - entity: sensor.fve_diverter_teplota_triac_dimmer_tuv
+                name: TRIAC TUV — TEMP
+              - entity: sensor.fve_diverter_prud_dimmer_tuv_cur_s
+                name: TRIAC TUV — CUR-S
+              - entity: switch.fve_diverter_fan_triac_tuv_dimmer_doska
+                name: Fan na doske TUV
+              - entity: sensor.fve_diverter_teplota_triac_dimmer_podlaha
+                name: TRIAC podlaha — TEMP
+              - entity: sensor.fve_diverter_prud_dimmer_podlaha_cur_s
+                name: TRIAC podlaha — CUR-S
+              - entity: switch.fve_diverter_fan_triac_podlaha_dimmer_doska
+                name: Fan na doske podlaha
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "5 · Vstupy"
+            icon: mdi:import
+          - type: entities
+            entities:
+              - entity: binary_sensor.fve_diverter_odber_teplej_vody_tuv
+                name: Prietok — odber TUV (G4)
+              - entity: binary_sensor.fve_diverter_daikin_ziada_cerpadlo_podlahy
+                name: Daikin žiada čerpadlo podlahy (opto G27)
+              - entity: binary_sensor.fve_diverter_daikin_ziada_ohrev_tuv_bojler
+                name: Daikin žiada ohrev TUV (opto K3M, G14)
+              - entity: switch.fve_diverter_cerpadlo_tuv_pocas_ohrevu
+                name: Voľba — obeh TUV počas ohrevu
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "6 · Ventilátor skrine"
+            icon: mdi:fan
+          - type: tile
+            entity: fan.fve_diverter_test_ventilator_skrine_pwm
+            name: Ventilátor skrine (PWM)
+            features:
+              - type: fan-speed
+          - type: entities
+            entities:
+              - entity: sensor.fve_diverter_ventilator_skrine_otacky
+                name: Otáčky (tacho)
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "7 · Meranie prípojky"
+            icon: mdi:transmission-tower
+          - type: markdown
+            content: >-
+              ESP číta Shelly priamo (rovnaký kód ako ostrá regulácia) — má
+              sedieť s hodnotou v HA (± oneskorenie pár sekúnd).
+          - type: entities
+            entities:
+              - entity: sensor.fve_diverter_test_pripojka_shelly_citane_esp
+                name: Prípojka — čítané ESP
+              - entity: sensor.shelly3em63g3_e4b063f540b0_vykon
+                name: Prípojka — Shelly v HA
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "8 · Diagnostika ESP"
+            icon: mdi:chip
+          - type: entities
+            entities:
+              - entity: binary_sensor.fve_diverter_test_esp_pripojene
+                name: Pripojené
+              - entity: sensor.fve_diverter_test_wifi_signal
+                name: WiFi signál
+              - entity: sensor.fve_diverter_test_wifi_ap_bssid
+                name: WiFi AP (BSSID)
+              - entity: sensor.fve_diverter_test_ip_adresa
+                name: IP adresa
+              - entity: sensor.fve_diverter_test_cas_od_zapnutia
+                name: Čas od zapnutia
+              - entity: sensor.fve_diverter_test_cas_esp_sntp
+                name: Čas ESP (SNTP)
+              - entity: number.fve_diverter_test_auto_vypnutie_spiral_po
+                name: Auto-vypnutie špirál po (0 = nikdy)
+              - entity: button.fve_diverter_test_restart_esp
+                name: Reštart ESP
+
+      # ----------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: "9 · Počítadlá zopnutí"
+            icon: mdi:counter
+          - type: entities
+            entities:
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_tuv
+                name: Stykač TUV
+              - entity: sensor.fve_diverter_pocet_zopnuti_bypass_tuv
+                name: Bypass TUV
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_podlaha
+                name: Stykač podlaha
+              - entity: sensor.fve_diverter_pocet_zopnuti_bypass_podlaha
+                name: Bypass podlaha
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_obeh_tuv
+                name: Čerpadlo TUV
+              - entity: sensor.fve_diverter_pocet_zopnuti_stykac_obeh_podlaha
+                name: Čerpadlo podlaha

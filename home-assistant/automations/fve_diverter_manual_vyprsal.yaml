@@ -1,0 +1,25 @@
+# Upozornenie, keď ESP vráti manuálny výkon TUV/podlahy po časovom limite na automatiku
+# (text senzor „Manuálny výkon — vypršal“). Vložiť do automations.yaml a zmeniť
+# notify.mobile_app_TVOJ_TELEFON na vlastnú notifikačnú službu.
+- id: fve_diverter_manual_vyprsal
+  alias: FVE diverter — manuálny výkon vypršal
+  description: ESP vrátil manuálny výkon TUV/podlahy po časovom limite na automatiku.
+  triggers:
+    - trigger: state
+      entity_id: sensor.fve_diverter_manualny_vykon_vyprsal
+  conditions:
+    - condition: template
+      value_template: >-
+        {{ trigger.to_state.state not in ['unknown', 'unavailable', '']
+           and trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}
+  actions:
+    - action: notify.mobile_app_TVOJ_TELEFON
+      data:
+        title: FVE diverter — manuál vypršal
+        message: Manuálny výkon {{ trigger.to_state.state }} skončil, regulácia ide znova automaticky.
+    - action: persistent_notification.create
+      data:
+        title: FVE diverter — manuál vypršal
+        message: Manuálny výkon {{ trigger.to_state.state }} skončil, regulácia ide znova automaticky.
+        notification_id: fve_diverter_manual_vyprsal
+  mode: queued

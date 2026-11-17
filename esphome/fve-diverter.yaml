@@ -1,0 +1,2680 @@
+# ============================================================================
+# ESP32 #2 — FVE diverter (ESPHome)
+# Riadi el. špirály z prebytku FVE: TUV 3 kW @ L1 + podlaha 600 W @ L2.
+# TRIAC fázovka (rbdimmer 40A) riadená cez 2× DimmerLink (I2C, hardvérový
+# Z-C/firing) — PRIMÁRNE riešenie, rozhodnutie 2026-08-27. PI regulácia na ESP.
+# ⚠️ Dve nesúvisiace funkcie, nemiešať: (1) čerpadlo TUV = náhrada TechController
+#    ECO, podľa vlastných senzorov, s Daikinom nič spoločné; (2) čerpadlo podlahy =
+#    NOVÁ funkcia podľa Daikin OPTO, TechController ECO s podlahou nikdy nič nemal.
+# Schéma: ../docs/schematics/fve_schema.svg   |   GPIO mapa v README.
+#
+# STAV (2026-11-15): OSTRÁ VERZIA — regulácia beží. Meranie: Shelly 3EM
+#       priamo (5 s, brzda/plyn) + Solax cloud cez HA (~4 min, krok podľa
+#       batérie), kým nepríde Solax dongl. Logika: ../README.sk.md
+#       sekcia „Ostrá verzia 2026-11-15“. HA časť: packages/fve_strategia.yaml.
+#       Testovacia verzia (fve-diverter-test.yaml) načíta tento súbor s
+#       regulacia_aktivna: "false" (všetko ručne z HA).
+# ============================================================================
+
+substitutions:
+  # === PRISPÔSOB SI (verejná verzia) =========================================
+  shelly_ip: "192.168.1.50"     # Shelly 3EM-63 Gen3 na prípojke (rpc/EM.GetStatus)
+  latitude: "48.15°"            # poloha domu — východ/západ slnka (okno FVE)
+  longitude: "17.11°"
+  # ==========================================================================
+  regulacia_aktivna: "true"     # testovacia verzia prepíše na "false"
+  # Relé (stykače, bypassy, čerpadlá, fany dosiek) v HA LEN NA ZOBRAZENIE (user 2026-11-16):
+  # ostrá regulácia ich aj tak do 5 s vráti podľa svojej logiky, ručné prepnutie by len
+  # zbytočne cvaklo stykačom. Vynútený ohrev = „manuálny výkon“. Stav ukazujú binary
+  # senzory s rovnakým názvom. Testovacia verzia prepíše na "false" (relé ovládateľné).
+  rele_internal: "true"
+  # OneWire zbernica pre DS18B20 B2 (vratná) a B3 (podlaha): vlastný pin (ako teraz) alebo
+  # spoločná zbernica G21 s B1 — na novej doske prepojky JP5/JP6 (2-3 = G21). Pri prepnutí
+  # na spoločnú zbernicu: obe na ow_bus + zapísať adresy nových snímačov.
+  ow_b2: ow_vratna              # alebo ow_bus
+  ow_b3: ow_podlaha             # alebo ow_bus
+
+esphome:
+  name: fve-diverter
+  friendly_name: FVE diverter
+  on_boot:
+    - priority: -100            # po obnovení režimu z flash a inicializácii vstupov
+      then:
+        - script.execute: cerpadlo_podlaha_aplikuj
+        # Krivka DimmerLinkov vždy LINEAR — regulácia s ňou počíta (prepočet výkon →
+        # úroveň). RMS overená meraním 2026-11-15 ako nevhodná. Prepínač krivky je
+        # len v testovacej verzii.
+        - lambda: |-
+            id(dimmerlink_tuv)->set_curve(dimmerlink::DimmingCurve::LINEAR);
+            id(dimmerlink_podlaha)->set_curve(dimmerlink::DimmingCurve::LINEAR);
+
+esp32:
+  board: esp32doit-devkit-v1
+  framework:
+    type: arduino
+
+# --- Sieť / správa (heslá v secrets.yaml, NIE v gite!) ---------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # ESPHome default na ESP32 = LIGHT (= ESP-IDF WIFI_PS_MIN_MODEM): rádio spí a
+  # budí sa až na DTIM beacon → príjem dát meškal až ~320 ms (zmerané 2026-11-09,
+  # ping 3,7–319 ms rovnomerne). ESP je napájané zo siete, úspora nemá zmysel —
+  # vypnuté kvôli odozve (príkazy z HA, odpovede Shelly/Solax).
+  power_save_mode: none
+  ap:                          # fallback AP, ak sa nepripojí
+    ssid: "FVE-diverter fallback"
+    password: !secret ap_password
+
+logger:
+  logs:
+    http_request: INFO   # Shelly každé 2 s → bez DEBUG hlavičiek (2026-11-16)
+
+api:
+  encryption:
+    key: !secret api_key
+  # Default ESPHome = 15 min: bez pripojeného HA sa ESP reštartuje. Diverter
+  # musí fungovať aj bez HA (výpadok HA nesmie reštartovať reguláciu a
+  # rozopnúť stykače) → vypnuté (2026-11-09).
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# ============================================================================
+# ČAS + SLNKO — okno FVE podľa východu/západu (od 2026-11-16, predtým pevné 6–20 h)
+# ============================================================================
+# SNTP aj výpočet východu/západu (`sun:`) bežia NEZÁVISLE od HA. Okno =
+# východ + X min … západ − Y min (number „Okno FVE — …“). Dolina (Influx 9/2025–
+# 11/2026, výroba Solax): priame slnko na panely ~2 h 40 min–3 h po východe, končí
+# ~2 h 15 min–2 h 30 min pred západom → default +120 / −120 min = vonkajšia hranica,
+# skutočný štart určí prvý prebytok („slnečný deň“, viď REGULÁCIA).
+# ----------------------------------------------------------------------------
+time:
+  - platform: sntp
+    id: esptime
+    timezone: Europe/Bratislava
+
+sun:
+  id: slnko_poloha
+  latitude: ${latitude}      # substitúcia hore
+  longitude: ${longitude}
+
+# ============================================================================
+# SENZORY TEPLOTY — DS18B20, KAŽDÝ NA VLASTNOM PINE (od 2026-11-14)
+# ============================================================================
+# 2026-11-14: snímače (lacné klony) fungujú každý sám, ale dva na spoločnej
+# zbernici NIE (dáta stiahnuté na 0, ESP číta samé nuly aj z neexistujúcej
+# adresy; test mimo kovu = nie únik cez potrubie). → 3 samostatné OneWire
+# zbernice, každá s vlastným 4,7 kΩ pull-upom DATA → 3,3 V:
+#   GPIO21 + R1 → TUV bojler · GPIO5 + R7 → vratná TUV · GPIO13 + R8 → podlaha
+# Červený/čierny (3,3 V / GND) môžu byť spoločné, oddelené sú len žlté (DATA).
+# GPIO5 = strapping pin (pri štarte musí byť HIGH) — pull-up R7 to zaručí.
+#
+# >>> AKO ZISTIŤ ADRESY (spraviť RAZ pri oživovaní): <<<
+# 1. Zakomentuj `address:` riadky nižšie (nechaj len platform + name),
+#    alebo nasaď túto kostru s pripojeným LEN JEDNÝM senzorom.
+# 2. Nahraj firmware, otvor logy (esphome logs / v HA).
+#    ESPHome vypíše: "Found sensors: 0x28ff1c0300aabbcc" atď.
+# 3. Priraď adresu miestu (pripájaj po jednom, alebo „teplý test" — chyť
+#    senzor do ruky a sleduj, ktorá teplota stúpne).
+# 4. Doplň adresy nižšie a kábel každého senzoru fyzicky oštítkuj.
+# ⚠️ VŽDY s adresami — bez nich ESPHome berie senzory „po poradí" a po
+#    reštarte môže TUV ukazovať podlahu!
+# ----------------------------------------------------------------------------
+one_wire:
+  - platform: gpio
+    id: ow_bus                 # TUV bojler (R1)
+    pin: GPIO21
+  - platform: gpio
+    id: ow_vratna              # vratná voda TUV (R7)
+    pin: GPIO5
+  - platform: gpio
+    id: ow_podlaha             # voda podlaha (R8)
+    pin: GPIO13
+
+sensor:
+  # Manuálny výkon — zostávajúci čas do návratu na automatiku (0 = manuál neaktívny)
+  - platform: template
+    name: "TUV — manuál zostáva"
+    id: manual_tuv_zostava
+    icon: mdi:timer-sand
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (id(manual_tuv_pct).state <= 0.5f || id(manual_tuv_od_ms) == 0) return 0.0f;
+      float lim = id(manual_limit_h).state * 60.0f;
+      float ubehlo = (millis() - id(manual_tuv_od_ms)) / 60000.0f;
+      return std::max(0.0f, lim - ubehlo);
+  - platform: template
+    name: "Podlaha — manuál zostáva"
+    id: manual_pod_zostava
+    icon: mdi:timer-sand
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (id(manual_podlaha_pct).state <= 0.5f || id(manual_pod_od_ms) == 0) return 0.0f;
+      float lim = id(manual_limit_h).state * 60.0f;
+      float ubehlo = (millis() - id(manual_pod_od_ms)) / 60000.0f;
+      return std::max(0.0f, lim - ubehlo);
+
+  - platform: dallas_temp
+    one_wire_id: ow_bus
+    address: 0x4900000023440328    # zistené 2026-11-14
+    name: "Teplota TUV bojler"
+    id: t_tuv
+    update_interval: 30s
+
+  - platform: dallas_temp
+    one_wire_id: ${ow_b2}
+    address: 0x9A00000022326128    # zistené 2026-11-14 (farby kábla štandardné)
+    name: "Teplota vratná voda TUV"
+    id: t_tuv_vratna
+    update_interval: 30s
+
+  - platform: dallas_temp
+    one_wire_id: ${ow_b3}
+    address: 0x690000002229DA28    # zistené 2026-11-15 (GPIO13 + R8)
+    name: "Teplota voda podlaha"
+    id: t_podlaha
+    update_interval: 30s
+
+  # VOLITEĽNÉ (2026-11-10): 4. DS18B20 — teplota v skrini pri dimmeroch.
+  # ⚠️ Od 2026-11-14 nie je voľný pin a klony nejdú po dvoch na zbernici →
+  # len ak sa nájde snímač, ktorý so susedom funguje, alebo cez DS2482 (I2C). Odkomentovať, ak sa
+  # doplní; adresu zistiť cez test verziu (tlačidlo „Test — hľadať DS18B20“ → „Test — DS18B20 adresy“).
+  # - platform: dallas_temp
+  #   address: 0x0000000000000000
+  #   name: "Teplota skriňa (dimmery)"
+  #   id: t_skrina
+  #   update_interval: 30s
+
+# ----------------------------------------------------------------------------
+# SENZORY NA DOSKÁCH DIMMEROV (rbdimmer 40A-CS, potvrdené z pinoutu 2026-09-13)
+# ----------------------------------------------------------------------------
+# Obe TRIAC dosky sú CS variant s vlastným current senzorom aj teplotným
+# senzorom TRIAC-u (piny TEMP/CUR-S na 8-pin konektore) — NEjdú cez DimmerLink
+# (ten prenáša cez I2C len VCC/GND/Z-C/DIM), musia priamo na ADC ESP32.
+# ⚠️ Použité ADC1 piny (GPIO32-39) — na ADC2 (napr. GPIO4/27/26/14/25) je
+# meranie nespoľahlivé, keď beží WiFi (HW obmedzenie ESP32, nie ESPHome bug).
+# TEMP/CUR-S sú na ADC1 pinoch — od 2026-11-10 (nové rozloženie podľa
+# ../docs/schematics/esp32_pinout_zapojenie.png): TUV 36/39, podlaha 34/35 (predtým
+# naopak). rbdimmer2 podlaha = GPIO34·35·32 tri piny vedľa seba (1 konektor),
+# rbdimmer1 TUV = GPIO36·39 + FAN GPIO33.
+# ⚠️⚠️ OPRAVA (2026-11-04): GPIO34/35/36/39 sú HW input-only (žiadny výstupný
+# driver) — FAN z dosiek dimmerov (digitálny výstup, library `fan_gpio`, pozri
+# TODO_fve_diverter.md) preto NESMIE byť na týchto pinoch. Od 2026-11-10:
+# FAN TUV = GPIO33, FAN podlaha = GPIO32 (oba výstupovo schopné).
+# TODO (dolaď pri oživení): attenuation aj kalibrácia (filters: calibrate_linear
+# alebo linear_map) na základe HW trimra "CURRENT SENSOR ADJUSTMENT" na doske
+# a skutočne nameraných referenčných hodnôt — surové napätie samo o sebe nie
+# je ani °C ani A. Až bude t_dimmer_tuv/podlaha v °C, odkomentovať automatiku
+# fanov (switch fan_dimmer_tuv/podlaha nižšie + on_value_range tu).
+  # TEMP dosky dimmera TUV (2026-11-15): holý NTC 10k B3950 proti GND (zmerané
+  # 10,87 kΩ pri ~23 °C) + pull-up R4 10 kΩ na 3,3 V → napätie → odpor → °C.
+  # Kým nie je TEMP zapojený, pin visí a hodnota je nezmysel — automatika teploty
+  # TRIAC-u (fany, ochrana) ide len pri zapnutom „Teplota TRIAC — zapojená“.
+  - platform: adc
+    pin: GPIO36
+    name: "Dimmer TUV — TEMP napätie"
+    id: t_dimmer_tuv_v
+    entity_category: diagnostic
+    update_interval: 10s
+    attenuation: 12db
+  - platform: resistance
+    sensor: t_dimmer_tuv_v
+    id: t_dimmer_tuv_r
+    configuration: DOWNSTREAM       # NTC medzi pinom a GND
+    resistor: 10kOhm
+    reference_voltage: 3.3V
+    internal: true
+  - platform: ntc
+    sensor: t_dimmer_tuv_r
+    name: "Teplota TRIAC dimmer TUV"
+    id: t_dimmer_tuv
+    calibration:
+      b_constant: 3950
+      reference_temperature: 25°C
+      reference_resistance: 10kOhm
+    filters:
+      - filter_out: nan
+
+  - platform: adc
+    pin: GPIO39
+    name: "Prúd dimmer TUV (CUR-S)"
+    id: i_dimmer_tuv
+    update_interval: 10s
+    attenuation: 12db
+
+  # TEMP dosky dimmera podlaha (2026-11-15): holý NTC 10k B3950 proti GND (zmerané
+  # 10,87 kΩ pri ~23 °C) + pull-up R5 10 kΩ na 3,3 V → napätie → odpor → °C.
+  # Kým nie je TEMP zapojený, pin visí a hodnota je nezmysel — automatika teploty
+  # TRIAC-u (fany, ochrana) ide len pri zapnutom „Teplota TRIAC — zapojená“.
+  - platform: adc
+    pin: GPIO34
+    name: "Dimmer podlaha — TEMP napätie"
+    id: t_dimmer_podlaha_v
+    entity_category: diagnostic
+    update_interval: 10s
+    attenuation: 12db
+  - platform: resistance
+    sensor: t_dimmer_podlaha_v
+    id: t_dimmer_podlaha_r
+    configuration: DOWNSTREAM       # NTC medzi pinom a GND
+    resistor: 10kOhm
+    reference_voltage: 3.3V
+    internal: true
+  - platform: ntc
+    sensor: t_dimmer_podlaha_r
+    name: "Teplota TRIAC dimmer podlaha"
+    id: t_dimmer_podlaha
+    calibration:
+      b_constant: 3950
+      reference_temperature: 25°C
+      reference_resistance: 10kOhm
+    filters:
+      - filter_out: nan
+
+  - platform: adc
+    pin: GPIO35
+    name: "Prúd dimmer podlaha (CUR-S)"
+    id: i_dimmer_podlaha
+    update_interval: 10s
+    attenuation: 12db
+
+# ----------------------------------------------------------------------------
+# POČÍTADLÁ ZOPNUTÍ STYKAČOV (2026-09-27, príprava na ESP; doplnené 2026-09-29
+# o obehové čerpadlá) — životné súčty ZAP-udalostí izolačného aj bypass stykača
+# (TUV aj podlaha) a stykačov obehových čerpadiel (TUV aj podlaha), spolu 6×.
+# Cieľ: neskôr vyhodnotiť podľa dní/týždňov, ktoré stykače sa spínajú
+# najviac/zbytočne často (napr. FVE hysteréza kmitá, Daikin bypass TUV beží
+# nočnou legionellou oveľa častejšie než čakané, alebo čerpadlo obehu cykluje
+# priveľmi krátko — súvisí s otvoreným bodom "vlastná hysteréza/min. čas
+# zapnutia čerpadiel" v TODO_fve_diverter.md).
+# ⚠️ Zámerne BEZ vlastného priameho zápisu z ESP32 do InfluxDB (žiadny nový
+# http_request/token na tomto zariadení) — tieto sensor entity idú ako
+# ktorákoľvek iná entita cez ESPHome API do HA a odtiaľ ich HA existujúca
+# InfluxDB integrácia zrkadlí ďalej (rovnaký mechanizmus ako pri všetkých
+# ostatných HA entitách, potvrdené v `fve_eval_lib.py` schémou entity_id/value).
+# Časová stopa nie je samostatné pole — je to timestamp bodu v InfluxDB v
+# momente zápisu (state_changed pri každom prírastku), presne to, čo treba pre
+# neskoršie zoskupenie podľa dňa/týždňa. `state_class: total_increasing`
+# (monotónny čítač, nikdy sa nevracia dozadu okrem reštartu čítača) — HA/Influx
+# to vie správne agregovať cez `sum`/derivačné funkcie namiesto priemerovania.
+# TODO (pri oživení): tento súčet zahŕňa aj testovacie/manuálne prepnutia z HA
+# počas stavania na stole — pred vyhodnotením „koľko sa spína v prevádzke"
+# poznačiť si stav počítadiel v momente uvedenia do ostrej prevádzky ako baseline.
+# 2026-11-10: senzory majú `lambda` + `update_interval: 60s` — po reštarte/OTA
+# hneď pošlú uložený súčet (predtým „unknown“, kým sa relé znova nezoplo).
+# Globály sa do flash zapisujú raz za minútu len pri zmene (ESPHome default
+# flash_write_interval) — NVS 384 KB s rozkladaním zápisov, opotrebenie nehrozí.
+# ----------------------------------------------------------------------------
+  - platform: template
+    name: "Počet zopnutí — stykač TUV"
+    id: pocet_zopnuti_stykac_tuv
+    icon: mdi:counter
+    unit_of_measurement: "×"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: return id(cnt_stykac_tuv);
+    update_interval: 60s
+
+  - platform: template
+    name: "Počet zopnutí — bypass TUV"
+    id: pocet_zopnuti_bypass_tuv
+    icon: mdi:counter
+    unit_of_measurement: "×"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: return id(cnt_bypass_tuv);
+    update_interval: 60s
+
+  - platform: template
+    name: "Počet zopnutí — stykač podlaha"
+    id: pocet_zopnuti_stykac_podlaha
+    icon: mdi:counter
+    unit_of_measurement: "×"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: return id(cnt_stykac_podlaha);
+    update_interval: 60s
+
+  - platform: template
+    name: "Počet zopnutí — bypass podlaha"
+    id: pocet_zopnuti_bypass_podlaha
+    icon: mdi:counter
+    unit_of_measurement: "×"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: return id(cnt_bypass_podlaha);
+    update_interval: 60s
+
+  - platform: template
+    name: "Počet zopnutí — stykač obeh TUV"
+    id: pocet_zopnuti_stykac_obeh_tuv
+    icon: mdi:counter
+    unit_of_measurement: "×"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: return id(cnt_stykac_obeh_tuv);
+    update_interval: 60s
+
+  - platform: template
+    name: "Počet zopnutí — stykač obeh podlaha"
+    id: pocet_zopnuti_stykac_obeh_podlaha
+    icon: mdi:counter
+    unit_of_measurement: "×"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: return id(cnt_stykac_obeh_podlaha);
+    update_interval: 60s
+
+# ----------------------------------------------------------------------------
+# STAV REGULÁCIE PRE HA (2026-11-09) — čítajú globály, ktoré plní regulačná
+# slučka (zatiaľ zakomentovaná → do oživenia ukazujú 0). HA z nich robí pomalé
+# rozhodnutia (Daikin, Tech M-9R) — pozri home-assistant/packages/
+# fve_strategia.yaml. update_interval 15 s zámerne (nie každý 3 s cyklus) —
+# menej zápisov do HA/InfluxDB, HA rozhodnutia aj tak pracujú v minútach.
+# ----------------------------------------------------------------------------
+  - platform: template
+    name: "Prebytok dostupný"
+    id: fve_prebytok_dostupny
+    icon: mdi:solar-power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: return id(prebytok_W);
+
+  - platform: template
+    name: "Diverter výkon (cieľ)"
+    id: diverter_vykon_ciel
+    icon: mdi:flash
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: return id(total_duty_W);
+
+  - platform: template
+    name: "Výkon TUV"
+    id: vykon_tuv_pct
+    icon: mdi:water-boiler
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: return id(duty_tuv_pub) * 100.0f;
+
+  - platform: template
+    name: "Výkon podlaha"
+    id: vykon_podlaha_pct
+    icon: mdi:heating-coil
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: return id(duty_pod_pub) * 100.0f;
+
+# ----------------------------------------------------------------------------
+# DIAGNOSTIKA REGULÁCIE (2026-11-15) — všetko ide cez HA do InfluxDB, aby sa
+# dalo neskôr vyhodnotiť, prečo regulácia spravila to, čo spravila.
+# ----------------------------------------------------------------------------
+  - platform: template
+    name: "Prípojka Shelly (ESP)"
+    id: shelly_siet_esp
+    icon: mdi:transmission-tower
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(shelly_last_ms) == 0 || millis() - id(shelly_last_ms) > 15000) return NAN;
+      return id(grid_power);
+
+  - platform: template
+    name: "Solax cloud — vek údaja"
+    icon: mdi:timer-sand
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      return id(solax_vek_s) > 99000 ? NAN : id(solax_vek_s);
+
+  - platform: template
+    name: "Regulácia — cieľ podľa Solaxu"
+    icon: mdi:target
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: return id(ciel_solax_W);
+
+  - platform: template
+    name: "Ventilátor skrine — výkon"
+    icon: mdi:fan
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: return id(fan_skrine_pct);
+
+# ----------------------------------------------------------------------------
+# POČÍTADLÁ ENERGIE (2026-11-15) — ODHAD z úrovne dimmera × menovitý výkon
+# špirály (nemeriame prúd). Denné súčty (reset o polnoci) + celkové súčty,
+# uložené vo flash. Týždeň/mesiac robí HA (utility_meter), všetko ide do InfluxDB.
+# TUV zvlášť: špirála (FVE/manuál) a bypass na žiadosť Daikinu (K3M).
+# ----------------------------------------------------------------------------
+  - platform: template
+    name: "Výkon do TUV (odhad)"
+    id: vykon_tuv_odhad
+    icon: mdi:water-boiler
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: return id(p_odhad_tuv);
+  - platform: template
+    name: "Výkon do TUV — Daikin K3M (odhad)"
+    id: vykon_tuv_daikin_odhad
+    icon: mdi:heat-pump
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: return id(p_odhad_tuv_daikin);
+  # K3M rozdelené podľa Shelly (2026-11-16): zo siete = odber zo siete v tej chvíli,
+  # najviac výkon špirály; zo slnka = zvyšok. Počíta sa každé 2 s (interval pri
+  # Shelly), tu PRIEMER za posledných 10 s. Batériu nevidíme — keď menič dorovnáva
+  # z batérie, Shelly ukáže ~0 a ráta sa to ako „zo slnka“. Bez merania → zo siete.
+  - platform: template
+    name: "Výkon do TUV — K3M zo siete (odhad)"
+    id: vykon_k3m_siet
+    icon: mdi:transmission-tower-import
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      static uint32_t pred = millis();
+      uint32_t n = millis();
+      float dt = (n - pred) / 1000.0f;
+      pred = n;
+      float p = dt > 0.5f ? id(k3m_siet_Ws) / dt : 0.0f;
+      id(k3m_siet_Ws) = 0.0f;
+      return p;
+  - platform: template
+    name: "Výkon do TUV — K3M zo slnka (odhad)"
+    id: vykon_k3m_slnko
+    icon: mdi:solar-power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      static uint32_t pred = millis();
+      uint32_t n = millis();
+      float dt = (n - pred) / 1000.0f;
+      pred = n;
+      float p = dt > 0.5f ? id(k3m_slnko_Ws) / dt : 0.0f;
+      id(k3m_slnko_Ws) = 0.0f;
+      return p;
+  - platform: template
+    name: "Výkon do podlahy (odhad)"
+    id: vykon_pod_odhad
+    icon: mdi:heating-coil
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: return id(p_odhad_pod);
+  # Celkové súčty (nikdy sa nenulujú, uložené vo flash) — z nich HA robí týždenné
+  # a mesačné súčty (utility_meter v packages/fve_energia.yaml).
+  - platform: integration
+    name: "Energia do TUV celkom"
+    sensor: vykon_tuv_odhad
+    time_unit: h
+    restore: true
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+  - platform: integration
+    name: "Energia do TUV — Daikin K3M celkom"
+    sensor: vykon_tuv_daikin_odhad
+    time_unit: h
+    restore: true
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+  - platform: integration
+    name: "Energia do TUV — K3M zo siete celkom"
+    sensor: vykon_k3m_siet
+    time_unit: h
+    integration_method: right     # hodnota = priemer za uplynulých 10 s
+    restore: true
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+  - platform: integration
+    name: "Energia do TUV — K3M zo slnka celkom"
+    sensor: vykon_k3m_slnko
+    time_unit: h
+    integration_method: right
+    restore: true
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+  - platform: integration
+    name: "Energia do podlahy celkom"
+    sensor: vykon_pod_odhad
+    time_unit: h
+    restore: true
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+  - platform: total_daily_energy
+    name: "Energia do TUV dnes"
+    power_id: vykon_tuv_odhad
+    restore: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.001
+  - platform: total_daily_energy
+    name: "Energia do TUV — Daikin K3M dnes"
+    power_id: vykon_tuv_daikin_odhad
+    restore: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.001
+  - platform: total_daily_energy
+    name: "Energia do TUV — K3M zo siete dnes"
+    power_id: vykon_k3m_siet
+    method: right
+    restore: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.001
+  - platform: total_daily_energy
+    name: "Energia do TUV — K3M zo slnka dnes"
+    power_id: vykon_k3m_slnko
+    method: right
+    restore: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.001
+  - platform: total_daily_energy
+    name: "Energia do podlahy dnes"
+    power_id: vykon_pod_odhad
+    restore: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.001
+
+  - platform: wifi_signal
+    name: "WiFi signál"
+    update_interval: 60s
+  - platform: uptime
+    name: "Čas od zapnutia"
+    update_interval: 60s
+
+# --- SOLAX CLOUD z HA (sensor.solax_cloud_realtime, jedno čítanie cloudu) ---
+  - platform: homeassistant
+    id: solax_bat_ha                # W, + nabíja, − vybíja
+    entity_id: sensor.solax_cloud_realtime
+    attribute: battery_power
+    internal: true
+  - platform: homeassistant
+    id: solax_soc_ha                # %
+    entity_id: sensor.solax_cloud_realtime
+    attribute: battery_soc
+    internal: true
+  - platform: homeassistant
+    id: solax_grid_ha               # W, + pretok do siete, − odber
+    entity_id: sensor.solax_cloud_realtime
+    attribute: grid_power
+    internal: true
+
+# --- DimmerLink — spätné čítanie (overenie, že modul úroveň prijal) ----------
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_tuv
+    update_interval: 30s
+    ac_frequency:
+      name: "DimmerLink TUV — frekvencia siete"
+    ac_period:
+      name: "DimmerLink TUV — perióda"
+    level:
+      name: "DimmerLink TUV — úroveň"
+    firmware_version:
+      name: "DimmerLink TUV — firmvér"
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_podlaha
+    update_interval: 30s
+    ac_frequency:
+      name: "DimmerLink podlaha — frekvencia siete"
+    ac_period:
+      name: "DimmerLink podlaha — perióda"
+    level:
+      name: "DimmerLink podlaha — úroveň"
+    firmware_version:
+      name: "DimmerLink podlaha — firmvér"
+
+# Automatika fanov na doskách dimmerov podľa teploty TRIAC-u: v regulácii (2026-11-15).
+
+# -- Ventilátor skrine — Tacho (RPM spätná väzba, 2026-11-05) ----------------
+# 4-vodičový PC/Noctua fan, pin3 (pozri "VENTILÁTOR SKRINE" nižšie) — open-
+# collector, 2 pulzy/otáčku (bežná konvencia u PC fanov, over pri oživení
+# podľa konkrétneho modelu). `pulse_counter` reportuje pulzy/min, `multiply:
+# 0.5` prepočíta na RPM. Interný pull-up (fan ťahá signál na GND pri pulze).
+# GPIO22 (od 2026-11-10, predtým GPIO4) — vedľa PWM GPIO23, oba vodiče fanu
+# skrine (PWM + tacho) na susedných pinoch. Pull-up len na 3,3 V (interný),
+# nikdy nie na 5 V.
+  # Prietokomer TUV (GPIO4) — len interné počítadlo pulzov pre „Odber teplej
+  # vody TUV“ (binary_sensor nižšie). Do HA nejde, l/min sa nekalibruje.
+  - platform: pulse_counter
+    pin:
+      number: GPIO4
+      mode:
+        input: true
+        pullup: true            # + externý R6 4,7 kΩ na 3,3 V
+    id: prietok_pulzy
+    internal: true
+    update_interval: 2s
+    count_mode:
+      rising_edge: INCREMENT
+      falling_edge: DISABLE
+
+  - platform: pulse_counter
+    pin:
+      number: GPIO22
+      mode:
+        input: true
+        pullup: true
+    name: "Ventilátor skrine — otáčky"
+    id: fan_tacho_rpm
+    update_interval: 5s         # default 60 s → otáčky by meškali o minútu
+    unit_of_measurement: "RPM"
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+
+# ============================================================================
+# BINÁRNE VSTUPY
+# ============================================================================
+binary_sensor:
+  # Okno FVE / slnečný deň (2026-11-16) — podľa nich sa riadi aj HA stratégia
+  # (packages/fve_strategia.yaml: Daikin slnečný režim, blokovanie TUV).
+  - platform: template
+    name: "Okno FVE"
+    icon: mdi:sun-clock
+    lambda: return id(v_okne_g);
+  - platform: template
+    name: "Slnečný deň"
+    icon: mdi:weather-sunny
+    lambda: return id(slnecny_den_g);
+  # Stav relé len na zobrazenie v HA (relé samotné sú v ostrej verzii internal —
+  # substitúcia rele_internal). Rovnaký názov ako pôvodné prepínače.
+  - platform: template
+    name: "Stykač TUV (cievka)"
+    id: stykac_tuv_stav
+    device_class: power
+    lambda: return id(stykac_tuv).state;
+  - platform: template
+    name: "Bypass stykač TUV (cievka)"
+    id: bypass_tuv_stav
+    device_class: power
+    lambda: return id(bypass_tuv).state;
+  - platform: template
+    name: "Stykač podlaha (cievka)"
+    id: stykac_podlaha_stav
+    device_class: power
+    lambda: return id(stykac_podlaha).state;
+  - platform: template
+    name: "Bypass stykač podlaha (cievka)"
+    id: bypass_podlaha_stav
+    device_class: power
+    lambda: return id(bypass_podlaha).state;
+  - platform: template
+    name: "Čerpadlo TUV"
+    id: cerpadlo_tuv_stav
+    device_class: running
+    lambda: return id(cerpadlo_tuv).state;
+  - platform: template
+    name: "Čerpadlo podlaha"
+    id: cerpadlo_podlaha_stav
+    device_class: running
+    lambda: return id(cerpadlo_podlaha).state;
+  - platform: template
+    name: "Fan TRIAC TUV (dimmer doska)"
+    id: fan_dimmer_tuv_stav
+    device_class: running
+    lambda: return id(fan_dimmer_tuv).state;
+  - platform: template
+    name: "Fan TRIAC podlaha (dimmer doska)"
+    id: fan_dimmer_podlaha_stav
+    device_class: running
+    lambda: return id(fan_dimmer_podlaha).state;
+
+  # Prietok studenej vody do zásobníka TUV = práve sa odoberá teplá voda.
+  # GPIO4 (Hall snímač z TECH EU-11, napájaný 3,3 V, R6 4,7 kΩ pull-up).
+  # Snímač dáva pri tečení pulzy (~5 Hz), v kľude stojí na náhodnej úrovni
+  # (podľa polohy kolieska) → stav sa odvodzuje z POČTU pulzov (prietok_pulzy),
+  # nie z úrovne pinu. l/min netreba (2026-11-15) — len ide / nejde.
+  # ON  = aspoň 2 pulzy za 2 s (> 30 pulzov/min)
+  # OFF = 10 s bez pulzov (krátke prerušenie pri miešaní vody nezhasne)
+  - platform: template
+    name: "Odber teplej vody TUV"
+    id: odber_tuv
+    device_class: running
+    icon: mdi:water-pump
+    lambda: |-
+      return id(prietok_pulzy).state > 30;
+    filters:
+      - delayed_off: 10s
+    on_state:
+      - text_sensor.template.publish:
+          id: odber_tuv_txt
+          state: !lambda 'return x ? std::string("ide") : std::string("nejde");'
+
+  # OPTO vstup: Daikin žiada zapnúť obehové čerpadlo podlahy (galv. izolované).
+  # NOVÁ funkcia — TechController ECO s podlahou nikdy nič nemal, nie je to
+  # jeho náhrada. Overiť pri Daikin dni, odkiaľ presne ide toto napätie
+  # (priamo z Daikinovho relé) — pozri TODO_fve_diverter.md.
+  # GPIO27 od 2026-11-10 (predtým GPIO13) — oba Daikin signály vedľa seba
+  # (27 + 14), pri relé čerpadiel (25 + 26).
+  - platform: gpio
+    pin:
+      number: GPIO27
+      mode:
+        input: true
+        pullup: true            # interný pull-up (open-collector opto)
+      inverted: true            # over polaritu opta pri oživení
+    filters:                    # debounce (dlhý kábel, AC opto modul) — overené v subtanku
+      - delayed_on: 500ms
+      - delayed_off: 500ms
+    name: "Daikin žiada čerpadlo podlahy"
+    id: daikin_ziada_cerpadlo
+    # OPRAVA 2026-11-16: bez toho sa on_state pri PRVOM stave po štarte nespustil →
+    # po každom reštarte/OTA ostalo čerpadlo (režim Auto) vypnuté, kým Daikin
+    # nezmenil signál (dnes minúty, pri trvalej požiadavke aj hodiny).
+    trigger_on_initial_state: true
+    on_state:
+      - script.execute: cerpadlo_podlaha_aplikuj
+
+  # Daikin žiada ohrev TUV pomocným ohrevom (BSH) — ZMENA 2026-11-10: NIE suchý
+  # kontakt, ale AC 230 V opto modul PARALELNE na cievku stykača K3M v hydroboxe
+  # (EHBH08DA9W7, svorky A1/A2). Napätie na cievke = Daikin chce BSH (napr.
+  # ručne „performance“ v Daikin appke, legionella, TČ nestíha). Dôvod: hlavné
+  # kontakty K3M sú silové (pri 3,3 V / mA spínajú nespoľahlivo) a sú v 230/400 V
+  # rozvodnici. 2-kanálový AC opto modul: kanál 1 = K3M cievka → GPIO14, kanál 2 =
+  # čerpadlo podlahy → GPIO27. Modul NIE PC817 DC modul (3,3–12 V vstup)!
+  # Kým modul nie je zapojený: GPIO14 visí na pull-upe = „nežiada“ (bezpečné).
+  # Logika (zakomentovaná regulácia, „DAIKIN BACKUP OHREV TUV“): žiada → ESP
+  # zopne LEN bypass stykač TUV priamo (3 kW naplno, bez ohľadu na FVE), limit
+  # max_t_tuv; pri výpadku teplomera TUV ide aj tak (stráži Daikin). GPIO14 pri
+  # štarte ESP krátko vysiela signál (JTAG MTMS) — pri opto výstupe neškodí
+  # (tranzistor optočlena obmedzí prúd), sériový rezistor NETREBA (zrušený
+  # 2026-11-13). VCC opto modulu = 3,3 V (nie 5 V — jeho pull-up by dal 5 V na pin).
+  - platform: gpio
+    pin:
+      number: GPIO14
+      mode:
+        input: true
+        pullup: true            # interný pull-up (open-collector výstup opta)
+      inverted: true            # opto zopne OUT na GND = žiada; over pri oživení
+    filters:                    # debounce (dlhý kábel, AC opto modul)
+      - delayed_on: 500ms
+      - delayed_off: 500ms
+    name: "Daikin žiada ohrev TUV (bojler)"
+    id: daikin_ziada_ohrev_tuv
+
+  - platform: status
+    name: "ESP pripojené"
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_tuv
+    update_interval: 10s
+    ready:
+      name: "DimmerLink TUV — pripravený"
+    error:
+      name: "DimmerLink TUV — chyba"
+    calibration_done:
+      name: "DimmerLink TUV — kalibrácia hotová"
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_podlaha
+    update_interval: 10s
+    ready:
+      name: "DimmerLink podlaha — pripravený"
+    error:
+      name: "DimmerLink podlaha — chyba"
+    calibration_done:
+      name: "DimmerLink podlaha — kalibrácia hotová"
+
+  # Relácia ohrevu podlahy z FVE (2026-11-09) — ON od prvého prebytku do podlahy
+  # až po dosiahnutie max teploty / koniec dňa / zmenu režimu. Počas nej beží
+  # čerpadlo podlahy nepretržite. HA podľa jej konca vracia Tech M-9R zóny.
+  - platform: template
+    name: "Ohrev podlahy z FVE"
+    id: ohrev_podlahy_fve
+    lambda: return id(pod_relacia);
+
+# ============================================================================
+# RELÉ — 3× samostatný 2-kanálový modul (active-LOW) — bezpečný default = VYP
+# ============================================================================
+# Zoskupené podľa fyzického modulu (viď schéma): TUV(17+16), podlaha(19+18),
+# čerpadlá(26 TUV + 25 podlaha — vedľa seba, od 2026-11-10). Bypass
+# stykač je PARALELNE k TRIAC-u (GATE), nie sériovo — viď PI slučka nižšie
+# pre ZOP/ROZ logiku.
+# ⚠️ Preskupené 2026-11-04 (pôvodne TUV 17+13, podlaha 18+5, čerpadlá 19+23)
+# — dôvod: uvoľnenie GPIO13/14/26 pre I2C a Daikin signály, fyzicky susedné
+# páry izolačný+bypass na pravej strane ESP32.
+# ⚠️ Preskupené 2026-11-10 (pinout ../docs/schematics/esp32_pinout_zapojenie.png):
+# čerpadlá 14→26 (TUV) a 33→25 (podlaha). GPIO14 pri štarte vysiela signál →
+# relé by mohlo cuknúť; 25/26 to nerobia. GPIO12 (strapping) nikdy.
+switch:
+  # -- 2-kan. modul: TUV (izolačný stykač + bypass stykač) --------------------
+  - platform: gpio
+    pin: GPIO17
+    name: "Stykač TUV (cievka)"
+    id: stykac_tuv
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    on_turn_on:
+      - lambda: |-
+          id(cnt_stykac_tuv)++;
+          id(pocet_zopnuti_stykac_tuv).publish_state(id(cnt_stykac_tuv));
+
+  - platform: gpio
+    pin: GPIO16
+    name: "Bypass stykač TUV (cievka)"
+    id: bypass_tuv
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    on_turn_on:
+      - lambda: |-
+          id(cnt_bypass_tuv)++;
+          id(pocet_zopnuti_bypass_tuv).publish_state(id(cnt_bypass_tuv));
+
+  # -- 2-kan. modul: podlaha (izolačný stykač + bypass stykač) ----------------
+  - platform: gpio
+    pin: GPIO19
+    name: "Stykač podlaha (cievka)"
+    id: stykac_podlaha
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    on_turn_on:
+      - lambda: |-
+          id(cnt_stykac_podlaha)++;
+          id(pocet_zopnuti_stykac_podlaha).publish_state(id(cnt_stykac_podlaha));
+
+  - platform: gpio
+    pin: GPIO18
+    name: "Bypass stykač podlaha (cievka)"
+    id: bypass_podlaha
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    on_turn_on:
+      - lambda: |-
+          id(cnt_bypass_podlaha)++;
+          id(pocet_zopnuti_bypass_podlaha).publish_state(id(cnt_bypass_podlaha));
+
+  # -- 2-kan. modul: čerpadlá ---------------------------------------------------
+  - platform: gpio
+    pin: GPIO26
+    name: "Čerpadlo TUV"
+    id: cerpadlo_tuv
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    on_turn_on:
+      - lambda: |-
+          id(cnt_stykac_obeh_tuv)++;
+          id(pocet_zopnuti_stykac_obeh_tuv).publish_state(id(cnt_stykac_obeh_tuv));
+
+  # ⚠️ GPIO12 zámerne NEpoužité (strapping pin, volí napäťovú úroveň flash pri
+  # boote — relé modul "bezpečný default VYP" pravdepodobne pri boote drží
+  # tento pin HIGH, čo by vynútilo 1,8V flash a zabránilo bootu).
+  # Pozn. 2026-11-10: relé čerpadla pri VYP slabo svietilo — príčina bola, že
+  # vodič bol fyzicky ešte podľa starého zapojenia na GPIO12 (YAML ho vôbec
+  # nepoužíva, pin „visel“). GPIO5 vadný NIE JE (neoverený, ostáva voľný).
+  # Čerpadlo podlahy na kontakte relé **NO** (2026-11-14 user: NC skúšané a
+  # vrátené späť na NO). Relé zopnuté = čerpadlo beží. Pri reštarte/výpadku ESP
+  # čerpadlo STOJÍ, kým ho script po boote znova nezapne (pár sekúnd).
+  # Ovláda ho LEN script `cerpadlo_podlaha_aplikuj` podľa selectu
+  # „Čerpadlo podlaha — režim“; ručné prepnutie switchu v HA platí len do
+  # najbližšej udalosti (zmena režimu / Daikin signálu / boot).
+  - platform: gpio
+    pin: GPIO25
+    name: "Čerpadlo podlaha"
+    id: cerpadlo_podlaha
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    on_turn_on:
+      - lambda: |-
+          id(cnt_stykac_obeh_podlaha)++;
+          id(pocet_zopnuti_stykac_obeh_podlaha).publish_state(id(cnt_stykac_obeh_podlaha));
+
+  # -- Fan na doskách dimmerov (2026-09-13, rbdimmer 40A-CS) -------------------
+  # NIE ako skriňový fan (GPIO23, PWM priamo na 4. pin fanu) — tu ide priamo logický
+  # signál na `FAN` pin dosky (červená/oranžová skupina na konektore, vedľa
+  # TEMP/CUR-S). Podľa dokumentácie rbdimmerThermalESP32 (GitHub,
+  # robotdyn-dimmer) má doska VLASTNÝ tranzistor, `FAN` je len jeho logický
+  # vstup ("low-current logic signal, can connect to any GPIO") — netreba
+  # externý MOSFET ako pri skriňovom fane. On/off, NIE PWM (fan má len 2
+  # vodiče, žiadny PWM vstup na fane samotnom).
+  # ⚠️ Neoverené z datasheetu (len z knižničnej dokumentácie) — pri oživení
+  # overiť multimetrom/oscilom: logický prah, polaritu (predpoklad: active-HIGH,
+  # `inverted` nižšie preto nie je nastavené), max. prúd z GPIO ktorý pin znesie.
+  # GPIO34/35/36/39 sú HW input-only, nemôžu riadiť fan (výstup). Od
+  # 2026-11-10: FAN TUV = GPIO33, FAN podlaha = GPIO32 (vedľa GPIO34/35 →
+  # rbdimmer2 má TEMP/CUR-S/FAN na 3 susedných pinoch).
+  - platform: gpio
+    pin: GPIO33
+    name: "Fan TRIAC TUV (dimmer doska)"
+    id: fan_dimmer_tuv
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    pin: GPIO32
+    name: "Fan TRIAC podlaha (dimmer doska)"
+    id: fan_dimmer_podlaha
+    internal: ${rele_internal}
+    restore_mode: ALWAYS_OFF
+
+  # -- Ventilátor skrine — ZÁLOŽNÉ relé na VCC — ZRUŠENÉ (2026-11-10) ----------
+  # Test 2026-11-10: súčasný fan sa pri PWM 0 % / OFF naozaj zastaví → relé
+  # netreba, VCC fanu ide priamo na 5 V (Mean Well). REZERVA pre prípad výmeny
+  # fanu za kus, ktorý sa pri 0 % PWM nezastaví:
+  #   - relé modul (active-LOW, VCC 3,3 V, JD-VCC 5 V, jumper vybratý) IN →
+  #     GPIO13 (rezervovaný, voľný), kontakt COM/NO do VCC vetvy fanu (5 V)
+  #   - odkomentovať blok nižšie (default ZAP = fan napájaný), v PI slučke
+  #     prípadne vypínať pri fan_duty == 0
+  # - platform: gpio
+  #   pin: GPIO13
+  #   name: "Ventilátor skrine — záložný vypínač napájania"
+  #   id: fan_power_cutoff
+  #   restore_mode: ALWAYS_ON
+  #   inverted: true
+
+  # -- Voľba: TEMP dosiek dimmerov zapojený (2026-11-15) -------------------------
+  # ZAP až keď sú TEMP vodiče + pull-upy R4/R5 zapojené — potom fany na doskách
+  # aj podľa teploty (≥ 50 °C ZAP, < 45 °C VYP) a ochrana TRIAC-u (≥ 80 °C →
+  # výkon daného dimmera 0, späť pod 70 °C). VYP = fany len podľa behu dimmera.
+  - platform: template
+    name: "Teplota TRIAC — zapojená"
+    id: teplota_triac_zapojena
+    icon: mdi:thermometer-check
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # -- Voľba (nie relé): obeh TUV počas ohrevu (2026-11-09) ----------------------
+  # ZAP = čerpadlo TUV beží pri každom ohreve TUV špirálou/Daikin bypassom (+5 min
+  # dobeh). Default VYP. Bojler obeh nepotrebuje — zmysel má len keď sme doma
+  # (teplá voda hneď v potrubí), preto ho HA prepína automaticky podľa víkendu/
+  # sviatku/prázdnin (fve_strategia.yaml, 3b); bez HA ostane posledný stav.
+  # Nezávisle od toho sa obeh zapne automaticky pri horúcej TUV cez slnko
+  # (prah "Čerpadlo TUV — auto od teploty", default 70 °C).
+  - platform: template
+    name: "Čerpadlo TUV počas ohrevu"
+    id: cerpadlo_tuv_pri_ohreve
+    icon: mdi:pump
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# ============================================================================
+# TRIAC DIMMERY (rbdimmer 40A) — riadené cez DimmerLink (I2C, hardvérový Z-C/firing)
+# ============================================================================
+# Rozhodnutie 2026-08-27: DimmerLink je PRIMÁRNE riešenie (nie ac_dimmer natívny
+# GPIO, nie "alternatíva/TODO") — už kúpené 2× DimmerLink 1CH, každý na vlastnú
+# fázu, vlastný hardvérový Z-C (Cortex-M+, bez softvérového jitteru na ESP32).
+# Máme aj 1× DimmerLink 2CH (kúpený skôr) — NEZAPOJENÝ, len záložný diel (1
+# zdieľaný Z-C pre oba kanály sa pre 2 rôzne fázy nehodí, viď schéma).
+# GPIO21/22 obsadené (OneWire, tacho fanu skrine) → I2C na GPIO2 (SDA) / GPIO15 (SCL).
+# Presunuté 2026-11-04 z GPIO26/14 (tie teraz nesú čerpadlo TUV a Daikin
+# signály) na GPIO2/15 — uvoľnené z fan_dimmer_tuv/podlaha switchov, ktoré sa
+# presunuli na GPIO32/25. GPIO2/15 sú strapping piny, ale len ako I2C idle-HIGH
+# (externé pull-upy), rovnaký princíp ako prečo tento projekt už bežne používa
+# GPIO2/5/15 ako výstupy bez problémov (pozri switch sekciu vyššie).
+# ADRESY (od 2026-11-16): TUV 0x54, podlaha 0x53. 0x50 sa nechá VOĽNÁ — všetky
+# moduly rbdimmer (DimmerLink, rbAmp) majú z výroby 0x50, nový modul sa tak dá
+# pripojiť bez kolízie a adresu mu zmeniť priamo v skrini. 0x52/0x51 = rbAmp TUV/podlaha
+# (plán). Pôvodne 0x50/0x51 (do 2026-11-16). Náhradný DimmerLink: v testovacej verzii
+# tlačidlá „nový DimmerLink 0x50 → 0x54 / 0x53“.
+# (Adresa sa mení zápisom do registra 0x30, zmena je OKAMŽITÁ a ukladá sa do
+# EEPROM — potvrdené z oficiálnej dokumentácie rbdimmer.com/docs/dimmerlink-*,
+# 2026-11-06.)
+# ----------------------------------------------------------------------------
+# ZAPOJENIE (overené oproti oficiálnej dokumentácii DimmerLink, 2026-11-06):
+# Vstupný konektor DimmerLink (ten, čo ide do ESP32) má 4 piny — VCC, GND a
+# DVA dátové piny, ktoré sú na doske popísané DVOJMO (UART aj I2C popis pre
+# ten istý fyzický pin, modul si protokol vie sám prepnúť, netreba iné
+# zapojenie): pin "TX/SDA" → GPIO2, pin "RX/SCL" → GPIO15. T.j. nezamieňať si
+# "TX/RX" na obrázku dosky za potrebu UART zapojenia — pri I2C ide presne na
+# tie isté 2 piny ako by išlo UART, len sa použijú ako SDA/SCL.
+# ⚠️ POVINNÝ externý pull-up: 4,7 kΩ na SDA aj SCL smerom k 3,3V — JEDEN
+# spoločný set pre CELÚ zbernicu (obe DimmerLink dosky), nie samostatne pre
+# každú. Interné pull-upy ESP32 sú na toto príliš slabé (dokumentácia to
+# uvádza explicitne pre ESP32/ESP8266). Bez neho hrozí presne to, čo vidno
+# v logu pri odpojených moduloch: "Communication failed!" na I2C scane.
+# Odporúčanie z dokumentácie navyše: káble pod 30 cm, 100 nF kondenzátor
+# VCC-GND tesne pri každom DimmerLinku.
+# Fyzicky na doštičke ESP32 (pasívny pin-header + skrutková svorkovnica,
+# obe na rovnakom GPIO nete — rovnaký typ ako inde v projekte): na GPIO2 aj
+# GPIO15 sa stretávajú 3 vodiče (2× DimmerLink SDA/SCL + 1× nožička
+# rezistora) — nedá sa dať všetko pod jednu skrutku rozumne, preto:
+#   - rezistor (tuhá nožička) → zasúvací pin header
+#   - oba DimmerLink vodiče (SDA spolu, SCL spolu) → skrutková svorkovnica,
+#     najprv zopnuté/skrútené spolu (prípadne dutinka-ferrule), nie len
+#     voľne rozstrapkané lanko pod jednou skrutkou
+# (2026-11-06, dohodnuté s userom pri fyzickom zapájaní na stole)
+# Výstupný konektor DimmerLink (ten, čo ide do rbdimmer dosky) je samostatný
+# pre KAŽDÝ modul (nezdieľa sa): VCC, GND, Z-C, Dim → na rbdimmer dosku piny
+# Z-C a DIM/Gate (pozri "DETAIL" panel v schéme).
+# ----------------------------------------------------------------------------
+# Komponent je LOKÁLNA KÓPIA (components/dimmerlink) z github://robotdyn-dimmer/
+# DimmerLink@main, commit 2d4e425 (2026-08-16), s opravou čítania registrov
+# (STOP medzi zápisom registra a čítaním — viď komentár v dimmerlink.cpp).
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [dimmerlink]
+
+i2c:
+  id: i2c_bus                  # testovacia verzia: I2C scan + zmena adresy DimmerLinku
+  sda: GPIO2
+  scl: GPIO15
+
+dimmerlink:
+  - id: dimmerlink_tuv
+    address: 0x54          # DimmerLink1 — Z-C ← L1, GATE rbdimmer1 ← DIM0 (TUV 3 kW); do 2026-11-16 0x50
+  - id: dimmerlink_podlaha
+    address: 0x53          # DimmerLink2 — Z-C ← L2, GATE rbdimmer2 ← DIM0 (podlaha 600 W); do 2026-11-16 0x51
+
+# default_transition_length: 0s — komponent má default 1 s (overené v zdrojáku
+# DimmerLink light.py, 2026-11-09); pre fázové riadenie špirál nechceme žiadne
+# plynulé prechody (regulácia počíta s okamžitou zmenou úrovne).
+# restore_mode: ALWAYS_OFF (2026-11-10) — ESPHome default RESTORE_DEFAULT_OFF by
+# po reštarte počas ohrevu obnovil poslednú úroveň (napr. 70 %) → v rozpore so
+# zásadou „štart na duty 0“; navyše by sa úroveň pri regulácii zbytočne
+# ukladala do flash. Po boote vždy VYP, regulácia nabehne od nuly.
+light:
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_tuv
+    id: dimmer_tuv
+    name: "Dimmer TUV"
+    default_transition_length: 0s
+    gamma_correct: 1.0           # úroveň = presne to, čo pošle regulácia
+    restore_mode: ALWAYS_OFF
+  - platform: dimmerlink
+    dimmerlink_id: dimmerlink_podlaha
+    id: dimmer_podlaha
+    name: "Dimmer podlaha"
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    restore_mode: ALWAYS_OFF
+
+# ============================================================================
+# DEKOMISOVANÉ: natívny ac_dimmer (priame GPIO GATE/ZC) — nahradené DimmerLink
+# vyššie. Ponechané ako referencia pre núdzový návrat, ak by DimmerLink zlyhal
+# (napr. I2C komunikácia nespoľahlivá) — vtedy treba GPIO4/16 (GATE) a GPIO27/33
+# (ZC) späť do schémy aj tu. min_power/method poznámky nižšie boli overené pre
+# TENTO natívny prístup — pri DimmerLine sa firing rieši hardvérovo na module,
+# analogický mechanizmus (ak existuje) treba dohľadať v jeho dokumentácii/FW.
+# ⚠️⚠️ KOLÍZIA (2026-09-08): GPIO27 medzičasom obsadené binary_sensor
+# "Daikin žiada ohrev TUV" (viď vyššie) — pri núdzovom návrate na ac_dimmer
+# treba pre ZC L1 vybrať INÝ voľný pin, GPIO27 už nie je voľné.
+# ⚠️⚠️ ĎALŠIA KOLÍZIA (2026-11-04): GPIO16 (pôvodne rezervované pre GATE
+# podlaha nižšie) je teraz obsadené switchom "Bypass stykač TUV" (viď vyššie)
+# — ale NEVADÍ: scenár "núdzový návrat" = DimmerLink sa prestáva používať,
+# takže sa SAMO uvoľní I2C zbernica (GPIO2/15) — presne 2 piny na 2× GATE.
+# ZC páry naďalej GPIO4 (voľné, rezervované) + GPIO33 (voľné, rezervované).
+# ⚠️ 2026-11-10: po novom rozložení sú GPIO4, 27, 33 obsadené — piny v
+# zakomentovanom bloku nižšie sú NEAKTUÁLNE. Pri reálnom návrate prerozdeliť
+# (voľný GPIO5 + uvoľnené I2C GPIO2/15).
+# T.j. nič netreba špeciálne chrániť navyše, fallback má svoje piny zaručené
+# automaticky práve vtedy, keď by bol potrebný. Skutočne voľné piny k
+# dnešnému dňu (2026-11-04, bez fallback úvahy): GPIO0, 1(TX0), 3(RX0), 5.
+# ⚠️⚠️ ĎALŠIA KOLÍZIA (2026-11-05): GPIO4 obsadené senzorom "Ventilátor skrine
+# — otáčky" (Tacho, pozri sensor: sekciu). Pri núdzovom návrate zostáva
+# zaručený už len GPIO33 (ZC podlaha) — pre ZC TUV treba pri reálnom návrate
+# nájsť iný pin (skutočne voľné sú už len GPIO0/1(TX0)/3(RX0)/12, všetky so
+# známym rizikom — pozri README "Bezpečnostné zásady"). Neriešiť teraz,
+# len si to uvedomiť, keby fallback scenár nastal.
+# ----------------------------------------------------------------------------
+# output:
+#   - platform: ac_dimmer
+#     id: dimmer_tuv
+#     gate_pin: GPIO4
+#     zero_cross_pin:
+#       number: GPIO27
+#       mode:
+#         input: true
+#         pullup: true
+#       inverted: true            # over hranu (FALLING) pri oživení
+#     method: leading             # fázové riadenie odporovej záťaže (TRIAC)
+#     min_power: 0%               # doladiť na stole, typicky 10-30 % (nie 5-10 %)
+#
+#   - platform: ac_dimmer
+#     id: dimmer_podlaha
+#     gate_pin: GPIO16
+#     zero_cross_pin:
+#       number: GPIO33
+#       mode:
+#         input: true
+#         pullup: true
+#       inverted: true
+#     method: leading
+#     min_power: 0%
+# ----------------------------------------------------------------------------
+
+# ============================================================================
+# VENTILÁTOR SKRINE — chladenie AC dimmerov (4-vodičový PWM fan)
+# ============================================================================
+# ⚠️ Prepracované 2026-11-04 (2): pôvodný plán (2-vodičový fan spínaný cez
+# MOSFET modul FR120N na strane GND) ZRUŠENÝ — reálny fan má 4 vodiče
+# (PC/Noctua PWM konvencia), rýchlosť rieši fan sám podľa PWM signálu na
+# vlastnom 4. pine, netreba žiadny MOSFET ani iný driver na napájaciu vetvu.
+# Zapojenie fanu priamo:
+#   pin1 GND  → spoločná GND
+#   pin2 VCC  → trvalo 5 V (Mean Well MDR-20-5) priamo. Záložné relé
+#               `fan_power_cutoff` zrušené 2026-11-10 (PWM 0 % fan zastaví) —
+#               rezerva GPIO13, pozri zakomentovaný blok v switch sekcii
+#   pin3 Tacho → GPIO22 (pulse_counter senzor "fan_tacho_rpm", pozri sensor:
+#               sekciu vyššie, interný pull-up) — od 2026-11-10 (predtým GPIO4)
+#   pin4 PWM  → priamo GPIO23 (ESP32 3.3V logika, fan má interný pull-up
+#               na PWM vstupe — over multimetrom/oscilom pri oživení, že
+#               3,3V level fanu stačí)
+# Rýchlosť = f(výkon dimmerov), NIE podľa teploty skrine — pozri fan_duty
+# v PI slučke nižšie (max(duty_tuv, duty_podlaha) + krátky dobeh po vypnutí).
+# ⚠️ Nezamieňať s malými ventilátormi na chladičoch samotných TRIAC dosiek
+# (rbdimmer 40A-CS má vlastný FAN+5V pin, doska si svoj fan rieši úplne sama
+# cez vlastný logický GPIO vstup — fan_dimmer_tuv/podlaha switche vyššie,
+# GPIO33/32) — tento pin ovláda VÝHRADNE spoločný ventilátor CELEJ
+# skrine, dve nezávislé funkcie, zámerne (rozhodnutie 2026-09-13).
+# Presunuté 2026-11-04 z GPIO25 na GPIO23 (uvoľnené z čerpadla podlaha,
+# presunutého na GPIO5; od 2026-11-10 je čerpadlo podlaha na GPIO25).
+# ----------------------------------------------------------------------------
+output:
+  - platform: ledc
+    pin: GPIO23
+    id: fan_pwm
+    frequency: 25000Hz    # nad počuteľné pásmo (bez pískania pri nízkom PWM)
+
+# ============================================================================
+# LADITEĽNÉ PARAMETRE (z HA) — ESP si ich pamätá vo flash (restore_value)
+# ============================================================================
+number:
+  - platform: template
+    name: "Max teplota TUV"
+    id: max_t_tuv
+    optimistic: true
+    restore_value: true
+    initial_value: 75
+    min_value: 40
+    max_value: 80
+    step: 1
+    unit_of_measurement: "°C"
+
+  # Teplota VODY v podlahovom okruhu (špirála 600 W je priamo v okruhu, nie
+  # v AKU nádrži) — default 35 °C (rozhodnutie 2026-11-09). Premenované z
+  # "Max teplota podlaha (AKU)" (default 60 bol pre AKU nádrž, tú už nemáme) —
+  # nové meno = nový hash v flash → po flashi naozaj naskočí 35, nie stará 60.
+  - platform: template
+    name: "Max teplota voda podlaha"
+    id: max_t_podlaha
+    optimistic: true
+    restore_value: true
+    initial_value: 35
+    min_value: 25
+    max_value: 50
+    step: 1
+    unit_of_measurement: "°C"
+
+  # Rozdelenie prebytku, keď je podlaha naplno (rozhodnutie 2026-11-09):
+  # tento podiel ide do batérie, zvyšok do TUV (25 % = 1/4 batéria, 3/4 TUV).
+  # Platí aj keď je batéria pod rezervou min SoC — rezervu drží menič sám
+  # (nevybíja pod min SoC), takže batéria sa len nabíja svojou časťou.
+  - platform: template
+    name: "Podiel prebytku do batérie"
+    id: podiel_baterie_pct
+    optimistic: true
+    restore_value: true
+    initial_value: 25
+    min_value: 0
+    max_value: 90
+    step: 5
+    unit_of_measurement: "%"
+
+  # Nad týmto SoC berieme batériu ako plnú → jej podiel ide tiež do TUV
+  # (inak by "jej" časť odtiekla do siete).
+  - platform: template
+    name: "SoC batérie považovaná za plnú"
+    id: soc_bateria_plna
+    optimistic: true
+    restore_value: true
+    initial_value: 97
+    min_value: 80
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+
+  # MANUÁLNE VYNÚTENIE výkonu (rozhodnutie 2026-09-14) — 0 = vypnuté (bežný
+  # FVE/Daikin automatický režim), 10-100 = vynúť túto hodnotu duty bez ohľadu
+  # na FVE prebytok/watchdog (rovnaký princíp ako Daikin — funguje aj pri
+  # stale meraní). Použitie: napr. keď je výpadok siete a beží sa na
+  # generátore — nastav 100 % a systém sám prejde na bypass (rovnaká ZOP
+  # sekvencia ako pri FVE, TRIAC-preload, nie priama vetva ako pri Daikinovi).
+  # Pri hodnotách <100 % potrebuje TRIAC vetvu, teda aj izolačný stykač
+  # zopnutý — manuálny režim preto prebíja aj "deň/noc" rozvrh (keď prevezmeš
+  # ručnú kontrolu, automatika ustúpi). Tepelný strop (max_t_tuv/podlaha)
+  # zostáva rešpektovaný aj tu.
+  # ČASOVÝ LIMIT (user 2026-11-16): manuál sa po „Manuálny výkon — časový limit“
+  # (default 5 h, 1–72 h — dlhý výpadok siete) sám vráti na 0 = automatika
+  # (interval „Časový limit manuálneho výkonu“) a HA pošle upozornenie (text senzor
+  # „Manuálny výkon — vypršal“). Každé nastavenie hodnoty > 0 spustí odpočet
+  # odznova. Po reštarte ESP je manuál VŽDY 0 (restore_value: false) — zabudnutý
+  # manuál neprežije ani výpadok prúdu.
+  - platform: template
+    name: "TUV — manuálny výkon (0=auto)"
+    id: manual_tuv_pct
+    optimistic: true
+    restore_value: false
+    initial_value: 0
+    min_value: 0
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+    on_value:
+      - lambda: |-
+          id(manual_tuv_od_ms) = x > 0.5f ? millis() : 0;
+
+  - platform: template
+    name: "Podlaha — manuálny výkon (0=auto)"
+    id: manual_podlaha_pct
+    optimistic: true
+    restore_value: false
+    initial_value: 0
+    min_value: 0
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+    on_value:
+      - lambda: |-
+          id(manual_pod_od_ms) = x > 0.5f ? millis() : 0;
+
+  - platform: template
+    name: "Manuálny výkon — časový limit"
+    id: manual_limit_h
+    icon: mdi:timer-cog-outline
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 1
+    max_value: 72
+    step: 1
+    unit_of_measurement: "h"
+
+  # OKNO FVE + SLNEČNÝ DEŇ (2026-11-16, nahrádza pevné „Stykač deň — začiatok/koniec
+  # (hodina)“ 6–20). Okno = východ + X … západ − Y. V okne sa čaká na prvý prebytok
+  # ≥ prah trvajúci aspoň N min (aj keď batéria nabíja, napr. na 20 %) = „slnečný deň“
+  # → až potom zopnú izolačné stykače a hreje sa, až do konca okna. Bez prebytku
+  # (zamračené) nezopne nič. HA stratégia (Daikin, TUV) sa riadi tým istým.
+  - platform: template
+    name: "Okno FVE — začiatok po východe"
+    id: okno_po_vychode_min
+    icon: mdi:weather-sunset-up
+    optimistic: true
+    restore_value: true
+    initial_value: 120
+    min_value: 0
+    max_value: 360
+    step: 10
+    mode: box
+    unit_of_measurement: "min"
+
+  - platform: template
+    name: "Okno FVE — koniec pred západom"
+    id: okno_pred_zapadom_min
+    icon: mdi:weather-sunset-down
+    optimistic: true
+    restore_value: true
+    initial_value: 120
+    min_value: -60
+    max_value: 360
+    step: 10
+    mode: box
+    unit_of_measurement: "min"
+
+  - platform: template
+    name: "Slnečný deň — prah prebytku"
+    id: slnecny_den_prah_w
+    icon: mdi:weather-sunny
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    min_value: 0
+    max_value: 3000
+    step: 50
+    mode: box
+    unit_of_measurement: "W"
+
+  - platform: template
+    name: "Slnečný deň — trvanie prebytku"
+    id: slnecny_den_trvanie_min
+    icon: mdi:timer-sand
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 0
+    max_value: 60
+    step: 1
+    mode: box
+    unit_of_measurement: "min"
+
+  # Čerpadlo TUV — 2 nezávislé "komfortné" dôvody navyše k FVE/Daikin hrievaniu
+  # (rozhodnutie 2026-09-13/2026-09-14, viď TODO_fve_diverter.md — vzor TECH
+  # EU-11 "Eco Circulation", ktorý ESP32 nahrádza; oba rozdielové — bojler
+  # PRIAMO voči vratnej vode, nie proti pevnému číslu ako originál):
+  #   #2 ODBER: prietok A (bojler−vratná) > delta_tuv_cerpadlo → beh na pevný
+  #      čas (cerpadlo_tuv_operation_min) — zrýchli teplú vodu na kohútiku.
+  #   #3 ÚDRŽBA: (bojler−vratná) > delta_tuv_udrzba, BEZ ohľadu na odber →
+  #      beh KONTINUÁLNE kým rozdiel neklesne pod (delta_tuv_udrzba − 1°C) —
+  #      udržuje teplú vodu v systéme priebežne (namiesto behu čerpadla 24/7).
+  # Oba zdieľajú rovnaké časové okno nižšie (mimo okna sa ani jeden nespúšťa).
+  # Defaulty NEOVERENÉ — doladiť pri oživení podľa reálneho správania.
+  - platform: template
+    name: "Čerpadlo TUV — prah rozdielu pri odbere (bojler − vratná)"
+    id: delta_tuv_cerpadlo
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 2
+    max_value: 15
+    step: 1
+    unit_of_measurement: "°C"
+
+  - platform: template
+    name: "Čerpadlo TUV — dĺžka behu po odbere"
+    id: cerpadlo_tuv_operation_min
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 1
+    max_value: 15
+    step: 1
+    unit_of_measurement: "min"
+
+  - platform: template
+    name: "Čerpadlo TUV — prah rozdielu pre údržbu (bojler − vratná)"
+    id: delta_tuv_udrzba
+    optimistic: true
+    restore_value: true
+    initial_value: 3
+    min_value: 1
+    max_value: 10
+    step: 1
+    unit_of_measurement: "°C"
+
+  # #4 (2026-11-09): bojler ≥ tento prah → obeh TUV beží automaticky, kým svieti
+  # slnko (hysteréza 2 °C). Rozvedie teplo do okruhu, špirála môže brať ďalej.
+  - platform: template
+    name: "Čerpadlo TUV — auto od teploty (slnko)"
+    id: cerpadlo_tuv_horuca_t
+    optimistic: true
+    restore_value: true
+    initial_value: 70
+    min_value: 50
+    max_value: 80
+    step: 1
+    unit_of_measurement: "°C"
+
+  # Časové okno pre dôvody #2 a #3 vyššie (na minúty od polnoci, 0-1439) —
+  # osobitne všedný deň a víkend. Default 5:30-23:45 pre oba (330/1425 min).
+  - platform: template
+    name: "Čerpadlo TUV — okno všedný deň od"
+    id: cerpadlo_tuv_okno_pracovny_od
+    optimistic: true
+    restore_value: true
+    initial_value: 330
+    min_value: 0
+    max_value: 1439
+    step: 5
+    unit_of_measurement: "min"
+
+  - platform: template
+    name: "Čerpadlo TUV — okno všedný deň do"
+    id: cerpadlo_tuv_okno_pracovny_do
+    optimistic: true
+    restore_value: true
+    initial_value: 1425
+    min_value: 0
+    max_value: 1439
+    step: 5
+    unit_of_measurement: "min"
+
+  - platform: template
+    name: "Čerpadlo TUV — okno víkend od"
+    id: cerpadlo_tuv_okno_vikend_od
+    optimistic: true
+    restore_value: true
+    initial_value: 330
+    min_value: 0
+    max_value: 1439
+    step: 5
+    unit_of_measurement: "min"
+
+  - platform: template
+    name: "Čerpadlo TUV — okno víkend do"
+    id: cerpadlo_tuv_okno_vikend_do
+    optimistic: true
+    restore_value: true
+    initial_value: 1425
+    min_value: 0
+    max_value: 1439
+    step: 5
+    unit_of_measurement: "min"
+
+  # --------------------------------------------------------------------------
+  # LADENIE REGULÁCIE (2026-11-15) — v HA pod „Konfigurácia“ zariadenia, bez
+  # nového firmvéru. Predvolené = hodnoty odsúhlasené pri nasadení.
+  # --------------------------------------------------------------------------
+  - platform: template
+    name: "Ladenie — zisk Shelly"
+    id: lad_zisk_shelly
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.3
+    min_value: 0.05
+    max_value: 1.0
+    step: 0.05
+  - platform: template
+    name: "Ladenie — krok zo Solaxu"
+    id: lad_krok_solax
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 70
+    min_value: 10
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+  - platform: template
+    name: "Ladenie — max pridanie zo Solaxu"
+    id: lad_krok_solax_max
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 1000
+    min_value: 100
+    max_value: 3600
+    step: 100
+    unit_of_measurement: "W"
+  - platform: template
+    name: "Ladenie — rezerva batérie"
+    id: lad_rezerva_bat
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 300
+    min_value: 0
+    max_value: 1500
+    step: 50
+    unit_of_measurement: "W"
+  - platform: template
+    name: "Ladenie — prah odberu (brzda)"
+    id: lad_prah_odber
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 200
+    min_value: 50
+    max_value: 1000
+    step: 25
+    unit_of_measurement: "W"
+  - platform: template
+    name: "Ladenie — prah pretoku (plyn)"
+    id: lad_prah_pretok
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 50
+    min_value: 0
+    max_value: 500
+    step: 10
+    unit_of_measurement: "W"
+  - platform: template
+    name: "Ladenie — pretok v núdzovom režime"
+    id: lad_nudza_pretok
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 300
+    min_value: 100
+    max_value: 1500
+    step: 50
+    unit_of_measurement: "W"
+  # Menovitý výkon špirál — kalibrácia Shelly 2026-11-15 večer (dom v kľude, bypass 100 %):
+  # TUV 3003 W, podlaha 595 W → v HA nastavené 3000 / 595 W.
+  # Používa regulácia (rozdelenie výkonu) aj počítadlá energie.
+  - platform: template
+    name: "Výkon špirály TUV"
+    id: p_spirala_tuv
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 3000
+    min_value: 1000
+    max_value: 3500
+    step: 50
+    unit_of_measurement: "W"
+  - platform: template
+    name: "Výkon špirály podlaha"
+    id: p_spirala_pod
+    entity_category: config
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 595
+    min_value: 200
+    max_value: 1000
+    step: 10
+    unit_of_measurement: "W"
+
+# ============================================================================
+# REŽIM KÚRENIA (2026-11-09) — žije na ESP (restore vo flash), aby regulácia
+# fungovala aj bez HA; v HA je to obyčajný select, ktorý číta aj HA strategia
+# (fve_strategia.yaml) pre Daikin. Poradie možností = index v regulácii
+# (active_index): 0 = podlaha sa NEhreje, 1/2 = podlaha má prednosť pred TUV.
+#   Vypnuté (leto)    — prebytok len do TUV + batérie
+#   Len z prebytkov   — prechodné obdobie: podlaha len zo špirály, Daikin kúrenie VYP (HA)
+#   Kúrenie zapnuté   — zima: Daikin kúri, cez slnko ho HA zníži/vypne, podlaha zo špirály
+# ⚠️ Pri zmene poradia/textov upraviť aj fve_strategia.yaml (porovnáva texty).
+# ============================================================================
+select:
+  - platform: template
+    name: "Režim kúrenia"
+    id: rezim_kurenia
+    icon: mdi:radiator
+    optimistic: true
+    restore_value: true
+    options:
+      - "Vypnuté (leto)"
+      - "Len z prebytkov"
+      - "Kúrenie zapnuté"
+    initial_option: "Vypnuté (leto)"
+
+  # Režim čerpadla TUV (2026-11-16, user: tvrdé ZAP/VYP pri servise/zapájaní, bez ohľadu
+  # na čokoľvek — aj manuál). Index: 0 Auto, 1 Trvalo ZAP, 2 VYP. Uložené vo flash.
+  # Default VYP — čerpadlo TUV ešte nie je zapojené (krátke káble); po zapojení → Auto.
+  # VYP/ZAP platí hneď (on_value), Auto prevezme regulácia do 5 s.
+  - platform: template
+    name: "Čerpadlo TUV — režim"
+    id: rezim_cerpadla_tuv
+    icon: mdi:pump
+    optimistic: true
+    restore_value: true
+    options:
+      - "Auto"
+      - "Trvalo ZAP"
+      - "VYP"
+    initial_option: "VYP"
+    on_value:
+      - lambda: |-
+          if (i == 2) { id(cerpadlo_tuv).turn_off(); ESP_LOGW("cerpadlo", "Čerpadlo TUV: režim VYP (tvrdé)"); }
+          else if (i == 1) { id(cerpadlo_tuv).turn_on(); ESP_LOGW("cerpadlo", "Čerpadlo TUV: režim Trvalo ZAP"); }
+
+  # Režim čerpadla podlahy (2026-11-14). Index: 0 Auto (Daikin), 1 Trvalo ZAP, 2 VYP.
+  # VYP aj Trvalo ZAP sú tvrdé — čerpadlo zapína/vypína JEDINE script nižšie podľa
+  # režimu (pri VYP podlaha z FVE ani manuálne nehreje).
+  # Auto = beží, keď Daikin žiada (GPIO27) ALEBO beží ohrev podlahy z FVE
+  # (pod_relacia, ostrá regulácia). Uložené vo flash → po reštarte rovnaký režim.
+  - platform: template
+    name: "Čerpadlo podlaha — režim"
+    id: rezim_cerpadla_podlaha
+    icon: mdi:pump
+    optimistic: true
+    restore_value: true
+    options:
+      - "Auto (Daikin)"
+      - "Trvalo ZAP"
+      - "VYP"
+    initial_option: "Trvalo ZAP"
+    on_value:
+      - script.execute: cerpadlo_podlaha_aplikuj
+
+# JEDINÉ miesto, ktoré zapína/vypína čerpadlo podlahy (aj ostrá regulácia ho
+# len volá po zmene pod_relacia). Udalosťami: boot, zmena režimu, Daikin signál.
+script:
+  - id: cerpadlo_podlaha_aplikuj
+    mode: queued
+    then:
+      - lambda: |-
+          int m = (int) id(rezim_cerpadla_podlaha).active_index().value_or(1);
+          bool want = (m == 1)
+                      || (m == 0 && (id(daikin_ziada_cerpadlo).state || id(pod_relacia)));
+          if (want != id(cerpadlo_podlaha).state) {
+            ESP_LOGI("cerpadlo", "Čerpadlo podlaha → %s (režim %d, Daikin %d, FVE %d)",
+                     want ? "ZAP" : "VYP", m, (int) id(daikin_ziada_cerpadlo).state,
+                     (int) id(pod_relacia));
+            if (want) id(cerpadlo_podlaha).turn_on(); else id(cerpadlo_podlaha).turn_off();
+          }
+
+text_sensor:
+  # Okno FVE dnes, napr. „08:49–14:05 · slnečný deň od 09:22“ / „· čaká na prebytok“.
+  - platform: template
+    name: "Okno FVE dnes"
+    icon: mdi:sun-clock-outline
+    update_interval: 30s
+    lambda: |-
+      if (id(okno_od_ep) == 0) return std::string("—");
+      std::string s = ESPTime::from_epoch_local(id(okno_od_ep)).strftime("%H:%M") + "–"
+                      + ESPTime::from_epoch_local(id(okno_do_ep)).strftime("%H:%M") + " · ";
+      if (id(slnecny_den_g))
+        s += "slnečný deň od " + ESPTime::from_epoch_local(id(slnecny_den_od_ep)).strftime("%H:%M");
+      else if (id(v_okne_g))
+        s += "čaká na prebytok";
+      else
+        s += "mimo okna";
+      return s;
+  # Časy pre HA (device_class timestamp, ISO v UTC) — víkendové blokovanie TUV
+  - platform: template
+    name: "Okno FVE — začiatok"
+    device_class: timestamp
+    update_interval: 60s
+    lambda: |-
+      if (id(okno_od_ep) == 0) return {};
+      return ESPTime::from_epoch_utc(id(okno_od_ep)).strftime("%Y-%m-%dT%H:%M:%SZ");
+  - platform: template
+    name: "Okno FVE — koniec"
+    device_class: timestamp
+    update_interval: 60s
+    lambda: |-
+      if (id(okno_do_ep) == 0) return {};
+      return ESPTime::from_epoch_utc(id(okno_do_ep)).strftime("%Y-%m-%dT%H:%M:%SZ");
+  - platform: template
+    name: "Slnečný deň — od"
+    device_class: timestamp
+    update_interval: 60s
+    lambda: |-
+      if (id(slnecny_den_od_ep) == 0) return {};
+      return ESPTime::from_epoch_utc(id(slnecny_den_od_ep)).strftime("%Y-%m-%dT%H:%M:%SZ");
+  # Posledné vypršanie manuálneho výkonu, napr. „TUV 16.11. 14:05 (po 5 h)“.
+  # HA automatizácia fve_diverter_manual_vyprsal posiela upozornenie pri zmene.
+  - platform: template
+    name: "Manuálny výkon — vypršal"
+    id: manual_vyprsal_txt
+    icon: mdi:timer-alert-outline
+
+  # Teplá voda — odber: „ide“ / „nejde“ (z binary_sensor odber_tuv, prietokomer G4)
+  - platform: template
+    name: "Teplá voda — odber"
+    id: odber_tuv_txt
+    icon: mdi:water
+    lambda: |-
+      return id(odber_tuv).state ? std::string("ide") : std::string("nejde");
+    update_interval: 60s
+
+  - platform: template
+    name: "Zdroj merania prebytku"
+    id: zdroj_merania_txt
+    icon: mdi:gauge
+    update_interval: 15s
+    lambda: |-
+      switch (id(zdroj_merania)) {
+        case 1:  return std::string("Solax dongl");
+        case 2:  return std::string("len Shelly (núdzový)");
+        case 3:  return std::string("Shelly + Solax cloud");
+        default: return std::string("žiadny — nehreje sa");
+      }
+
+  # Posledný krok regulácie (diagnostika: prečo pridala/ubrala) — publikuje regulácia
+  - platform: template
+    name: "Regulácia — posledný krok"
+    id: regulacia_krok_txt
+    icon: mdi:math-log
+
+  # Prečo beží čerpadlo TUV (odber / údržba / ohrev / horúca TUV / manuál / —)
+  - platform: template
+    name: "Čerpadlo TUV — dôvod"
+    id: cerpadlo_tuv_dovod_txt
+    icon: mdi:pump
+
+  # Solax cloud — čas merania (stav HA senzora, ISO 8601) → epoch pre reguláciu
+  - platform: homeassistant
+    id: solax_cas_ha
+    entity_id: sensor.solax_cloud_realtime
+    internal: true
+    on_value:
+      - lambda: |-
+          // "2026-11-15T14:07:01+00:00" (HA timestamp, UTC) → unix čas
+          int Y, M, D, h, m, s;
+          if (sscanf(x.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) != 6) return;
+          int y = Y - (M <= 2);
+          int era = (y >= 0 ? y : y - 399) / 400;
+          int yoe = y - era * 400;
+          int doy = (153 * (M + (M > 2 ? -3 : 9)) + 2) / 5 + D - 1;
+          int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+          int64_t days = (int64_t) era * 146097 + doe - 719468;
+          int64_t ep = days * 86400 + h * 3600 + m * 60 + s;
+          // posun časovej zóny (+HH:MM / -HH:MM), ak nie je UTC
+          size_t p = x.find_last_of("+-");
+          if (p != std::string::npos && p > 18) {
+            int th = 0, tm = 0;
+            if (sscanf(x.c_str() + p + 1, "%d:%d", &th, &tm) >= 1)
+              ep -= (x[p] == '+' ? 1 : -1) * (th * 3600 + tm * 60);
+          }
+          id(solax_epoch) = ep;
+
+button:
+  - platform: restart
+    name: "Reštart ESP"
+
+# ============================================================================
+# GLOBÁLY pre reguláciu
+# ============================================================================
+globals:
+  - id: manual_tuv_od_ms          # kedy bol nastavený manuálny výkon TUV (0 = manuál neaktívny)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: manual_pod_od_ms          # kedy bol nastavený manuálny výkon podlaha (0 = neaktívny)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: grid_power              # výkon na prípojke zo Shelly 3EM (W); - = export
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: shelly_last_ms          # čas posledného platného čítania Shelly
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: total_duty_W            # integrátor = cieľový výkon špirál spolu (0..3600 W)
+    type: float
+    restore_value: false
+    initial_value: '0'
+  # --- Solax (primárny zdroj, lokálny dongl) — normalizované hodnoty ---------
+  - id: bat_power_W             # výkon batérie (W): + nabíja, − vybíja
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: grid_export_W           # prípojka podľa Solaxu (W): + pretok do siete, − odber
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: bat_soc                 # SoC batérie (%)
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: solax_last_ms           # čas posledného platného čítania Solaxu (0 = ešte nikdy)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # --- Stav regulácie (pre HA cez template senzory) --------------------------
+  - id: prebytok_W              # dostupný prebytok = nabíjanie batérie + pretok + výkon špirál
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: duty_tuv_pub            # posledný výsledný duty TUV (0..1)
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: duty_pod_pub            # posledný výsledný duty podlaha (0..1)
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: zdroj_merania           # 0 = žiadny, 1 = Solax, 2 = Shelly (núdzový)
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: tuv_full                # hysteréza max teploty TUV (2 °C)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: pod_full                # hysteréza max teploty podlahy (2 °C)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: pod_relacia             # relácia ohrevu podlahy (čerpadlo beží nepretržite)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: cerpadlo_tuv_ohrev_until_ms  # obeh TUV počas ohrevu — dobeh do kedy
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: cerpadlo_tuv_horuca_active   # obeh TUV pri horúcej TUV cez slnko (hysteréza)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: okno_od_ep              # okno FVE dnes — začiatok (unix čas), 0 = nevypočítané
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: okno_do_ep              # okno FVE dnes — koniec (unix čas)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: slnecny_den_od_ep       # kedy začal slnečný deň (unix čas); platí, ak je v dnešnom okne
+    type: uint32_t              # (restore: po reštarte ESP cez deň stykače hneď späť)
+    restore_value: true
+    initial_value: '0'
+  - id: prebytok_od_ms          # od kedy trvá prebytok ≥ prah (pred slnečným dňom), 0 = netrvá
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: v_okne_g                # pre senzory: teraz je okno FVE
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: slnecny_den_g           # pre senzory: dnes je slnečný deň (a sme v okne)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: slnko_last_ms           # naposledy prebytok > 200 W ("svieti slnko", 10 min držanie)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: fan_afterrun_until_ms    # dobeh ventilátora po vypnutí dimmerov
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: cerpadlo_tuv_flow_until_ms  # EU-11-style beh čerpadla TUV po odbere (do kedy)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: cerpadlo_tuv_udrzba_active  # čerpadlo TUV — údržbový beh práve prebieha (hysteréza)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: bypass_tuv_change_ms      # čas poslednej zmeny bypass stykača TUV (debounce)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: bypass_podlaha_change_ms  # čas poslednej zmeny bypass stykača podlaha (debounce)
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: bypass_tuv_fve            # FVE strana chce bypass TUV (nezávisle od Daikinu)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: bypass_tuv_armed          # dimmer už 1 cyklus (≥3s) na 100% pred ZOP — proti iskreniu
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: bypass_podlaha_armed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # --- Ostrá verzia 2026-11-15: Shelly + Solax cloud cez HA ------------------
+  - id: shelly_seen_ms            # posledné Shelly čítanie, ktoré regulácia už spracovala
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: shelly_brzda_ep           # unix čas posledného brzdenia podľa Shelly (odber)
+    type: int64_t
+    restore_value: false
+    initial_value: '0'
+  - id: solax_epoch               # čas merania posledného údaja zo Solax cloudu (unix)
+    type: int64_t
+    restore_value: false
+    initial_value: '0'
+  - id: solax_pending_epoch       # nový údaj videný 1. cyklus (čaká na atribúty)
+    type: int64_t
+    restore_value: false
+    initial_value: '0'
+  - id: solax_seen_epoch          # posledný údaj, z ktorého sa už spravil krok
+    type: int64_t
+    restore_value: false
+    initial_value: '0'
+  - id: solax_vek_s               # vek údaja zo Solaxu (s), 99999 = žiadny
+    type: float
+    restore_value: false
+    initial_value: '99999'
+  - id: ciel_solax_W              # posledný cieľ výkonu špirál z kroku zo Solaxu
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: p_odhad_tuv               # odhad výkonu do TUV zo špirály (FVE/manuál), W
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: p_odhad_tuv_daikin        # odhad výkonu do TUV cez bypass na žiadosť Daikinu (K3M), W
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: k3m_siet_Ws               # K3M zo siete — nazbieraná energia od posledného zverejnenia, W·s
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: k3m_slnko_Ws              # K3M zo slnka (FVE) — nazbieraná energia od posledného zverejnenia, W·s
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: p_odhad_pod               # odhad výkonu do podlahy, W
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: fan_skrine_pct            # PWM ventilátora skrine (%)
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: fan_tuv_teplo             # fan dosky TUV zapnutý kvôli teplote TRIAC-u (hysteréza)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: fan_pod_teplo
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: triac_prehriaty_tuv       # TRIAC TUV ≥ 80 °C (do < 70 °C) → výkon 0
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: triac_prehriaty_pod
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: fan_tuv_until_ms          # dobeh fanu na doske dimmera TUV
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: fan_pod_until_ms          # dobeh fanu na doske dimmera podlaha
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # Počítadlá zopnutí stykačov (viď "POČÍTADLÁ ZOPNUTÍ" nižšie) — restore_value:
+  # true zámerne (na rozdiel od ostatných globálov vyššie), sú to ŽIVOTNÉ súčty
+  # (prežijú reštart/OTA), nie stav jedného regulačného cyklu.
+  - id: cnt_stykac_tuv
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: cnt_bypass_tuv
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: cnt_stykac_podlaha
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: cnt_bypass_podlaha
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: cnt_stykac_obeh_tuv
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: cnt_stykac_obeh_podlaha
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+
+# ============================================================================
+# MERANIE PREBYTKU (ostrá verzia 2026-11-15)
+# ============================================================================
+# Kým nie je Solax dongl (rozhodnutie usera 2026-11-15):
+#  - SHELLY 3EM (prípojka) priamo z ESP (čítanie 2 s, regulácia 5 s) = rýchla brzda/plyn:
+#      odber zo siete > 200 W → uber, pretok do siete > 50 W → pridaj.
+#  - SOLAX CLOUD cez HA (sensor.solax_cloud_realtime, ~raz za 4 min): výkon
+#    batérie, SoC, sieť + čas merania (dataTime). Pri KAŽDOM NOVOM údaji jeden
+#    krok regulácie podľa nabíjania batérie (podlaha → TUV/batéria ¾:¼).
+#    Obmedzenie: kým batéria nie je na min SoC, menič pri mraku dorovná
+#    špirály z batérie a Shelly ukazuje ~0 → zistí sa až pri ďalšom údaji
+#    zo Solaxu (max ~5 min, odsúhlasené). Preto rezerva 300 W a krok max
+#    +1000 W. Údaj starší ako 10 min → len Shelly.
+#  - Bez Shelly (> 15 s) → výkon 0. Bez HA/Solaxu → núdzový režim len zo
+#    Shelly (hreje len z viditeľného pretoku, drží ~300 W pretok).
+# Regulácia počíta len z NOVÉHO merania (oprava 2026-11-15 — pri zamrznutom
+# meraní by inak opakovane pripočítavala starú chybu).
+# ----------------------------------------------------------------------------
+http_request:
+  # request BLOKUJE hlavnú slučku (ESPHome http_request je synchrónny) — pri čítaní
+  # každé 2 s krátky timeout; Shelly bežne odpovie za desiatky ms
+  timeout: 800ms
+
+interval:
+  # Časový limit manuálneho výkonu (každých 10 s). Po vypršaní → 0 = automatika,
+  # záznam do text senzora (→ upozornenie v HA). Beží aj v testovacej verzii.
+  - interval: 10s
+    then:
+      - lambda: |-
+          const uint32_t lim_ms = (uint32_t) (id(manual_limit_h).state * 3600000.0f);
+          auto skontroluj = [&](template_::TemplateNumber *num, uint32_t &od, const char *meno) {
+            if (num->state <= 0.5f || od == 0) return;
+            if (millis() - od < lim_ms) return;
+            ESP_LOGW("manual", "%s: manuálny výkon %.0f %% vypršal po %.0f h -> automatika",
+                     meno, num->state, id(manual_limit_h).state);
+            od = 0;
+            auto call = num->make_call();
+            call.set_value(0);
+            call.perform();
+            char buf[64];
+            auto t = id(esptime).now();
+            if (t.is_valid())
+              snprintf(buf, sizeof(buf), "%s %d.%d. %02d:%02d (po %.0f h)", meno, t.day_of_month,
+                       t.month, t.hour, t.minute, id(manual_limit_h).state);
+            else
+              snprintf(buf, sizeof(buf), "%s (po %.0f h)", meno, id(manual_limit_h).state);
+            id(manual_vyprsal_txt).publish_state(buf);
+          };
+          skontroluj(id(manual_tuv_pct), id(manual_tuv_od_ms), "TUV");
+          skontroluj(id(manual_podlaha_pct), id(manual_pod_od_ms), "Podlaha");
+
+  # --- SHELLY 3EM-63 Gen3 (${shelly_ip}, overené 2026-11-09) ------------------
+  # Čítanie každé 2 s (2026-11-16, predtým 5 s; 1 s fungovalo, user zvolil 2 s pre
+  # rezervu). Regulácia beží stále každých 5 s s posledným údajom (zisky ladené na 5 s);
+  # 2 s využíva rozdelenie K3M sieť/slnko.
+  # Shelly neodpovedá → skúšať len každých 5 s (request blokuje slučku do timeoutu).
+  - interval: 2s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              static uint32_t posledny = 0;
+              uint32_t n = millis();
+              bool ok = id(shelly_last_ms) != 0 && n - id(shelly_last_ms) <= 5000;
+              if (!ok && posledny != 0 && n - posledny < 5000) return false;
+              posledny = n;
+              return true;
+          then:
+            - http_request.get:
+                url: "http://${shelly_ip}/rpc/EM.GetStatus?id=0"
+                capture_response: true
+                max_response_buffer_size: 2048
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (response->status_code != 200) return;
+                        bool ok = json::parse_json(body, [](JsonObject root) -> bool {
+                          // is<float>() — hodnota 0 W je platná, nie "chýba"
+                          if (!root["total_act_power"].is<float>()) return false;
+                          id(grid_power) = root["total_act_power"].as<float>();   // + odber, − pretok
+                          return true;
+                        });
+                        if (ok) id(shelly_last_ms) = millis();   // LEN pri úspešnom parse
+                on_error:
+                  then:
+                    - logger.log: "Shelly EM.GetStatus: request zlyhal"
+      # K3M (bypass TUV na žiadosť Daikinu): rozdelenie výkonu na zo siete / zo slnka.
+      # Zo siete = aktuálny odber zo siete, najviac výkon špirály (odber sa prednostne
+      # pripíše špirále — opatrný odhad); bez čerstvého merania → celé zo siete.
+      - lambda: |-
+          static uint32_t pred = 0;
+          uint32_t n = millis();
+          float dt = pred != 0 ? (n - pred) / 1000.0f : 0.0f;
+          pred = n;
+          float p = id(p_odhad_tuv_daikin);
+          if (p <= 0.0f || dt <= 0.0f || dt > 10.0f) return;
+          bool cerstve = id(shelly_last_ms) != 0 && n - id(shelly_last_ms) <= 5000;
+          float siet = cerstve ? clamp(id(grid_power), 0.0f, p) : p;
+          id(k3m_siet_Ws) += siet * dt;
+          id(k3m_slnko_Ws) += (p - siet) * dt;
+
+  # OKNO FVE (2026-11-16): východ + X … západ − Y pre dnešný deň.
+  # Samostatne (nie v lambde regulácie) — výpočet slnka potrebuje zásobník; v regulácii
+  # ESP padalo (OTA rollback 2026-11-16).
+  # Kontrola každých 10 s, výpočet hneď po synchronizácii času a potom raz za minútu
+  # (prvý výpočet do 60 s po štarte → keby padol, OTA rollback ešte zaberie).
+  - interval: 10s
+    then:
+      - lambda: |-
+          if (!id(esptime).now().is_valid()) return;
+          static uint32_t posl = 0;
+          if (id(okno_od_ep) != 0 && millis() - posl < 60000) return;
+          posl = millis();
+          // dátum v UTC o 0:00 → východ/západ toho dňa (v SEČ/SELČ vždy po 0:00 UTC)
+          ESPTime d = id(esptime).utcnow();
+          d.hour = 0; d.minute = 0; d.second = 0;
+          d.recalc_timestamp_utc();
+          auto vy = id(slnko_poloha).sunrise(d, -0.833);
+          auto za = id(slnko_poloha).sunset(d, -0.833);
+          if (!vy.has_value() || !za.has_value()) return;
+          id(okno_od_ep) = vy->timestamp + (int32_t) id(okno_po_vychode_min).state * 60;
+          id(okno_do_ep) = za->timestamp - (int32_t) id(okno_pred_zapadom_min).state * 60;
+
+  # ============================================================================
+  # REGULÁCIA (každých 5 s) — rozdelenie prebytku, stykače, bypass, čerpadlá,
+  # ventilátory. Celá logika je zhrnutá v ../README.sk.md
+  # (sekcia „Ostrá verzia 2026-11-15“).
+  # ============================================================================
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (!${regulacia_aktivna}) return;     // testovacia verzia: regulácia vypnutá
+          // Po štarte 15 s nič neprepínať (2026-11-15: pri OTA sa ESP 2× zresetovalo, keď
+          // hneď po štarte naraz zoplo viac stykačov — prúdový náraz / rušenie).
+          if (millis() < 15000) return;
+          // Najviac JEDNO relé za cyklus (5 s) — stykače sa nezopínajú naraz.
+          int zmeny_rele = 0;
+          auto prepni = [&](switch_::Switch *sw, bool zap) -> bool {
+            if (sw->state == zap) return true;
+            if (zmeny_rele >= 1) return false;          // počká na ďalší cyklus
+            zmeny_rele++;
+            if (zap) sw->turn_on(); else sw->turn_off();
+            return true;
+          };
+          // VÝKON → ÚROVEŇ DIMMERA. Krivka DimmerLinku LINEAR (úroveň = podiel polperiódy).
+          // Prepočet podľa KALIBRÁCIE Shelly 2026-11-15 (batéria na min SoC, dom v kľude,
+          // TUV 3003 W, podlaha 595 W pri 100 %; oba dimmery rovnako → priemer). Teória
+          // fázového riadenia (L − sin 2πL / 2π) dávala v strede o 3–5 bodov menej.
+          // Pod 20 % úrovne nemerané → body z teórie. RMS krivka nepoužiteľná (25 % → 0 W).
+          // Regulácia počíta vo VÝKONE (duty = podiel výkonu) → tu inverzia tabuľky.
+          auto set_dimmer = [](light::LightState *l, float vykon) {
+            static const float LT[] = {0.00f, 0.10f, 0.15f, 0.20f, 0.26f, 0.30f, 0.34f, 0.37f, 0.40f,
+                                       0.45f, 0.50f, 0.55f, 0.60f, 0.66f, 0.74f, 1.00f};
+            static const float FT[] = {0.000f, 0.008f, 0.022f, 0.057f, 0.123f, 0.178f, 0.240f, 0.294f, 0.353f,
+                                       0.446f, 0.545f, 0.641f, 0.722f, 0.814f, 0.907f, 1.000f};
+            if (vykon <= 0.001f) {
+              if (l->current_values.is_on()) l->turn_off().set_transition_length(0).perform();
+            } else {
+              float lv = 1.0f;
+              for (int i = 1; i < 16; i++) {
+                if (vykon <= FT[i]) {
+                  lv = LT[i - 1] + (LT[i] - LT[i - 1]) * (vykon - FT[i - 1]) / (FT[i] - FT[i - 1]);
+                  break;
+                }
+              }
+              // +0,005: komponent úroveň orezáva (brightness × 100 → celé %), nie zaokrúhľuje
+              float level = vykon >= 0.999f ? 1.0f : std::min(1.0f, lv + 0.005f);
+              auto call = l->turn_on();
+              call.set_brightness(level);
+              call.set_transition_length(0);
+              call.perform();
+            }
+          };
+          uint32_t now = millis();
+          auto t = id(esptime).now();
+          char buf[160];
+          std::string krok;                      // diagnostika: čo spravil tento cyklus
+          //
+          // --- MERANIE ------------------------------------------------------------
+          bool shelly_ok = id(shelly_last_ms) != 0 && (now - id(shelly_last_ms) <= 15000);
+          bool shelly_new = shelly_ok && id(shelly_last_ms) != id(shelly_seen_ms);
+          if (shelly_new) id(shelly_seen_ms) = id(shelly_last_ms);
+          int64_t ep_now = t.is_valid() ? (int64_t) t.timestamp : 0;
+          int64_t vek = (ep_now > 0 && id(solax_epoch) > 0) ? ep_now - id(solax_epoch) : 99999;
+          id(solax_vek_s) = (float) vek;
+          bool solax_ok = shelly_ok && vek >= -120 && vek <= 600
+                          && !std::isnan(id(solax_bat_ha).state) && !std::isnan(id(solax_soc_ha).state)
+                          && !std::isnan(id(solax_grid_ha).state);
+          // Nový údaj = zmenil sa čas merania A v ďalšom cykle je stále ten istý
+          // (state a atribúty prichádzajú z HA zvlášť — počkám 1 cyklus, kým dorazia všetky).
+          bool solax_new = false;
+          if (solax_ok && id(solax_epoch) != id(solax_seen_epoch)) {
+            if (id(solax_epoch) == id(solax_pending_epoch)) {
+              solax_new = true;
+              id(solax_seen_epoch) = id(solax_epoch);
+            } else {
+              id(solax_pending_epoch) = id(solax_epoch);
+            }
+          }
+          id(zdroj_merania) = !shelly_ok ? 0 : (solax_ok ? 3 : 2);
+          //
+          // --- OKNO FVE + SLNEČNÝ DEŇ (2026-11-16) — izolačné stykače + kedy sa smie
+          // hriať z FVE. Okno = východ + X … západ − Y (interval OKNO FVE nižšie, raz za minútu).
+          // V okne čakám na prebytok ≥ prah trvajúci N min → slnečný deň do konca okna.
+          // Čas nesynchronizovaný (NTP) → mimo okna, bezpečný default.
+          // Okno počíta interval „OKNO FVE“ (raz za minútu, mimo tejto lambdy — zásobník).
+          uint32_t ep = t.is_valid() ? (uint32_t) t.timestamp : 0;
+          bool okno_fve = ep != 0 && id(okno_od_ep) != 0 && ep >= id(okno_od_ep) && ep < id(okno_do_ep);
+          auto slnecny = [&]() -> bool {
+            return okno_fve && id(slnecny_den_od_ep) >= id(okno_od_ep) && id(slnecny_den_od_ep) < id(okno_do_ep);
+          };
+          if (okno_fve && !slnecny() && id(prebytok_W) >= id(slnecny_den_prah_w).state) {
+            if (id(prebytok_od_ms) == 0) id(prebytok_od_ms) = now;
+            if (now - id(prebytok_od_ms) >= (uint32_t) (id(slnecny_den_trvanie_min).state * 60000.0f)) {
+              id(slnecny_den_od_ep) = ep;
+              ESP_LOGI("fve", "Slnečný deň: prebytok %.0f W ≥ %.0f W počas %.0f min → stykače ZAP do konca okna",
+                       id(prebytok_W), id(slnecny_den_prah_w).state, id(slnecny_den_trvanie_min).state);
+            }
+          } else {
+            id(prebytok_od_ms) = 0;
+          }
+          bool slnecny_den = slnecny();
+          id(v_okne_g) = okno_fve;
+          id(slnecny_den_g) = slnecny_den;
+          // Ďalej v kóde: hrieť z FVE a držať izolačné stykače len v slnečný deň.
+          bool is_day = slnecny_den;
+          //
+          // --- DAIKIN BACKUP OHREV TUV (K3M): LEN bypass TUV priamo, bez ohľadu na
+          // FVE/meranie/čas. Limit max_t_tuv; výpadok DS18B20 TUV (NaN) → ide aj tak
+          // (stráži Daikin, rozhodnutie 2026-11-11).
+          bool daikin_override_tuv = id(daikin_ziada_ohrev_tuv).state
+                                      && (std::isnan(id(t_tuv).state)
+                                          || id(t_tuv).state < id(max_t_tuv).state);
+          //
+          // --- POVOLENIA (hysteréza 2 °C; NaN → porovnania false → nehreje z FVE)
+          if (id(t_tuv).state >= id(max_t_tuv).state) id(tuv_full) = true;
+          else if (id(t_tuv).state < id(max_t_tuv).state - 2.0f) id(tuv_full) = false;
+          bool tuv_en = is_day && !id(tuv_full) && (id(t_tuv).state < id(max_t_tuv).state);
+          //
+          int rezim = (int) id(rezim_kurenia).active_index().value_or(0);  // 0 leto, 1 len prebytky, 2 kúrenie
+          // Čerpadlo podlahy ručne VYP → podlaha sa nehreje vôbec (voda by nebežala).
+          bool cerpadlo_pod_vyp = (int) id(rezim_cerpadla_podlaha).active_index().value_or(0) == 2;
+          if (id(t_podlaha).state >= id(max_t_podlaha).state) id(pod_full) = true;
+          else if (id(t_podlaha).state < id(max_t_podlaha).state - 2.0f) id(pod_full) = false;
+          bool pod_en = is_day && rezim != 0 && !cerpadlo_pod_vyp && !id(pod_full)
+                        && (id(t_podlaha).state < id(max_t_podlaha).state);
+          //
+          const float CAP_POD = id(p_spirala_pod).state, CAP_TUV = id(p_spirala_tuv).state;   // ladenie z HA
+          float cap_pod = pod_en ? CAP_POD : 0.0f;
+          float cap_tuv = tuv_en ? CAP_TUV : 0.0f;
+          //
+          // --- HISTÓRIA výkonu špirál (D) — údaj zo Solaxu je starý 1–5 min, treba
+          // vedieť, aký výkon špirál bol V ČASE MERANIA (128 × 5 s ≈ 10 min).
+          static float hist_d[128];
+          static int64_t hist_ep[128];
+          static int hist_i = 0, hist_n = 0;
+          auto d_v_case = [&](int64_t ep) -> float {
+            float best = id(total_duty_W);
+            int64_t best_ep = -1;
+            for (int k = 0; k < hist_n; k++) {
+              if (hist_ep[k] <= ep && hist_ep[k] > best_ep) { best_ep = hist_ep[k]; best = hist_d[k]; }
+            }
+            if (best_ep < 0 && hist_n > 0) {            // starší než história → najstarší záznam
+              int64_t o = INT64_MAX;
+              for (int k = 0; k < hist_n; k++) if (hist_ep[k] < o) { o = hist_ep[k]; best = hist_d[k]; }
+            }
+            return best;
+          };
+          //
+          // --- REGULÁCIA: D = cieľový výkon špirál spolu (W) -----------------------
+          // Ladenie z HA (2026-11-15) — sekcia "LADENIE REGULÁCIE" v number:
+          const float KI = id(lad_zisk_shelly).state;              // zisk pre Shelly kroky
+          const float K_SOLAX = id(lad_krok_solax).state / 100.0f; // časť rozdielu pri kroku zo Solaxu (len pridávanie)
+          const float KROK_MAX = id(lad_krok_solax_max).state;     // max pridanie jedným krokom zo Solaxu
+          const float REZERVA_BAT = id(lad_rezerva_bat).state;     // batéria si nechá aspoň toľko (cloud mešká)
+          const float PRAH_ODBER = id(lad_prah_odber).state;       // odber zo siete → brzda
+          const float PRAH_PRETOK = id(lad_prah_pretok).state;     // pretok do siete → plyn
+          const float NUDZA_PRETOK = id(lad_nudza_pretok).state;   // len Shelly: držaný pretok
+          float D = id(total_duty_W);
+          if (!shelly_ok) {
+            // WATCHDOG: bez Shelly nemám brzdu → nehrejem z prebytku. Bypass
+            // rozopne bežná ROZ sekvencia nižšie (TRIAC prevezme prúd).
+            if (D > 0.0f) krok = "bez Shelly → 0 W";
+            D = 0.0f;
+            id(prebytok_W) = 0.0f;
+            id(bypass_tuv_armed) = false;
+            id(bypass_podlaha_armed) = false;
+          } else {
+            float g = id(grid_power);                    // + odber, − pretok
+            float p_imp = std::max(0.0f, g), p_exp = std::max(0.0f, -g);
+            if (shelly_new) {
+              if (p_imp > PRAH_ODBER) {
+                float dD = -2.0f * KI * p_imp;           // ťahám zo siete → rýchlo uber
+                if (ep_now > 0) id(shelly_brzda_ep) = ep_now;
+                id(prebytok_W) = 0.0f;
+                if (D > 0.0f) {
+                  snprintf(buf, sizeof(buf), "Shelly odber %.0f W → %.0f W", p_imp, std::max(dD, -D));
+                  krok = buf;
+                }
+                D += dD;
+              } else if (solax_ok) {
+                if (p_exp > PRAH_PRETOK && cap_pod + cap_tuv > D + 1.0f) {
+                  float dD = KI * p_exp;                 // batéria už neberie → do špirál
+                  snprintf(buf, sizeof(buf), "Shelly pretok %.0f W → +%.0f W", p_exp, dD);
+                  krok = buf;
+                  D += dD;
+                  id(prebytok_W) = std::max(id(prebytok_W), p_exp + D);
+                }
+              } else {
+                // NÚDZOVÝ REŽIM len zo Shelly: batériu nevidím → len z pretoku,
+                // držím ~300 W pretok. Pretok zmizol → špirály možno ťahajú
+                // z batérie → D na polovicu.
+                id(prebytok_W) = p_exp + D;
+                if (g > -100.0f) {
+                  if (D > 1.0f) { krok = "len Shelly: pretok zmizol → výkon / 2"; }
+                  D *= 0.5f;
+                } else if (cap_pod + cap_tuv > D + 1.0f || p_exp < NUDZA_PRETOK) {
+                  float dD = KI * (p_exp - NUDZA_PRETOK);
+                  snprintf(buf, sizeof(buf), "len Shelly: pretok %.0f W → %+.0f W", p_exp, dD);
+                  krok = buf;
+                  D += dD;
+                }
+              }
+            }
+            if (solax_new && p_imp <= PRAH_ODBER) {
+              // KROK ZO SOLAXU: S = prebytok v čase merania (batéria + sieť + špirály).
+              float b = clamp(id(podiel_baterie_pct).state / 100.0f, 0.0f, 0.9f);
+              if (id(solax_soc_ha).state >= id(soc_bateria_plna).state) b = 0.0f;   // plná → podiel do TUV
+              float d_s = d_v_case(id(solax_epoch));
+              float S = id(solax_bat_ha).state + id(solax_grid_ha).state + d_s;
+              float avail = S - REZERVA_BAT;
+              float Dt = (avail <= cap_pod) ? avail : cap_pod + (avail - cap_pod) * (1.0f - b);
+              Dt = clamp(Dt, 0.0f, cap_pod + cap_tuv);
+              float dD = Dt - d_s;
+              if (dD > 0.0f) dD = std::min(K_SOLAX * dD, KROK_MAX);  // pridávam opatrne, uberám hneď
+              id(ciel_solax_W) = Dt;
+              id(prebytok_W) = std::max(0.0f, S);
+              snprintf(buf, sizeof(buf), "Solax: bat %+.0f W, sieť %+.0f W, SoC %.0f %%, špirály %.0f W → cieľ %.0f W (%+.0f W)",
+                       id(solax_bat_ha).state, id(solax_grid_ha).state, id(solax_soc_ha).state, d_s, Dt, dD);
+              krok = buf;
+              if (dD <= 0.0f) {
+                D = std::min(D, Dt);                     // uber (nikdy nad cieľ)
+              } else if (id(shelly_brzda_ep) >= id(solax_epoch)) {
+                krok += " — Shelly medzitým brzdil, nepridávam";
+              } else {
+                D = std::max(D, d_s + dD);               // pridaj (pretok zo Shelly ponechaj)
+              }
+            }
+          }
+          D = clamp(D, 0.0f, cap_pod + cap_tuv);
+          id(total_duty_W) = D;
+          if (ep_now > 0) {                              // história pre kroky zo Solaxu
+            hist_d[hist_i] = D;
+            hist_ep[hist_i] = ep_now;
+            hist_i = (hist_i + 1) % 128;
+            if (hist_n < 128) hist_n++;
+          }
+          float duty_pod = cap_pod > 0.0f ? clamp(D / CAP_POD, 0.0f, 1.0f) : 0.0f;
+          float duty_tuv = cap_tuv > 0.0f ? clamp((D - cap_pod) / CAP_TUV, 0.0f, 1.0f) : 0.0f;
+          //
+          // --- MANUÁLNE VYNÚTENIE (0 = vypnuté) — prebíja reguláciu aj watchdog.
+          // Tepelný strop platí. Podlaha nie pri čerpadle ručne VYP.
+          bool manual_tuv_active = id(manual_tuv_pct).state > 0.5f;
+          if (manual_tuv_active) {
+            duty_tuv = (id(t_tuv).state < id(max_t_tuv).state)
+                       ? clamp(id(manual_tuv_pct).state / 100.0f, 0.0f, 1.0f) : 0.0f;
+          }
+          bool manual_podlaha_active = id(manual_podlaha_pct).state > 0.5f && !cerpadlo_pod_vyp;
+          if (manual_podlaha_active) {
+            duty_pod = (id(t_podlaha).state < id(max_t_podlaha).state)
+                       ? clamp(id(manual_podlaha_pct).state / 100.0f, 0.0f, 1.0f) : 0.0f;
+          }
+          // --- TEPLOTA TRIAC-U (2026-11-15) — len pri „Teplota TRIAC — zapojená“ a
+          // rozumnej hodnote (−20…150 °C). ≥ 80 °C → výkon dimmera 0, späť pod 70 °C.
+          // Daikin bypass (K3M) to neovplyvní — TRIAC vtedy nevedie.
+          bool tt_ok = id(teplota_triac_zapojena).state;
+          auto platna = [](float x) { return !std::isnan(x) && x > -20.0f && x < 150.0f; };
+          float t_tr_tuv = id(t_dimmer_tuv).state, t_tr_pod = id(t_dimmer_podlaha).state;
+          if (tt_ok && platna(t_tr_tuv)) {
+            if (t_tr_tuv >= 80.0f) id(triac_prehriaty_tuv) = true;
+            else if (t_tr_tuv < 70.0f) id(triac_prehriaty_tuv) = false;
+            if (t_tr_tuv >= 50.0f) id(fan_tuv_teplo) = true;
+            else if (t_tr_tuv < 45.0f) id(fan_tuv_teplo) = false;
+          } else {
+            id(triac_prehriaty_tuv) = false;
+            id(fan_tuv_teplo) = false;
+          }
+          if (tt_ok && platna(t_tr_pod)) {
+            if (t_tr_pod >= 80.0f) id(triac_prehriaty_pod) = true;
+            else if (t_tr_pod < 70.0f) id(triac_prehriaty_pod) = false;
+            if (t_tr_pod >= 50.0f) id(fan_pod_teplo) = true;
+            else if (t_tr_pod < 45.0f) id(fan_pod_teplo) = false;
+          } else {
+            id(triac_prehriaty_pod) = false;
+            id(fan_pod_teplo) = false;
+          }
+          if (id(triac_prehriaty_tuv) && duty_tuv > 0.0f) {
+            snprintf(buf, sizeof(buf), "TRIAC TUV prehriaty %.0f °C → výkon TUV 0", t_tr_tuv);
+            krok = buf;
+            duty_tuv = 0.0f;
+          }
+          if (id(triac_prehriaty_pod) && duty_pod > 0.0f) {
+            snprintf(buf, sizeof(buf), "TRIAC podlaha prehriaty %.0f °C → výkon podlahy 0", t_tr_pod);
+            krok = buf;
+            duty_pod = 0.0f;
+          }
+          id(duty_tuv_pub) = duty_tuv;
+          id(duty_pod_pub) = duty_pod;
+          if (!krok.empty()) {
+            ESP_LOGI("regulacia", "%s", krok.c_str());
+            id(regulacia_krok_txt).publish_state(krok);
+          }
+          //
+          // --- RELÁCIA OHREVU PODLAHY — čerpadlo beží nepretržite od prvého prebytku
+          // do podlahy, kým voda nedosiahne max / neskončí deň / nezmení sa režim.
+          bool rel_pred = id(pod_relacia);
+          if (!pod_en && !manual_podlaha_active) id(pod_relacia) = false;
+          else if (duty_pod > 0.05f) id(pod_relacia) = true;
+          if (rel_pred != id(pod_relacia)) id(cerpadlo_podlaha_aplikuj).execute();
+          //
+          // --- BYPASS STYKAČ TUV: ZOP pri ≥ 97 % (dimmer najprv 1 cyklus na 100 %),
+          // ROZ pri ≤ 95 %, min. 15 s medzi zmenami. Daikin override priamo.
+          const uint32_t BYPASS_MIN_DWELL_MS = 15000;
+          // OPRAVA 2026-11-15: FVE strana má VLASTNÝ stav (bypass_tuv_fve), nie fyzický
+          // stav stykača — keď bypass drží Daikin (K3M), FVE ho nesmie brať ako „svoj“
+          // (predtým každých 5 s prepínala dimmer na 100 % a späť a energiu z Daikinu
+          // počítala ako FVE).
+          bool want_bypass_tuv = id(bypass_tuv_fve);
+          if (id(bypass_tuv_fve)) {
+            if (duty_tuv <= 0.95f && (now - id(bypass_tuv_change_ms) > BYPASS_MIN_DWELL_MS)) {
+              want_bypass_tuv = false;
+              id(bypass_tuv_change_ms) = now;
+              set_dimmer(id(dimmer_tuv), duty_tuv);
+            } else {
+              set_dimmer(id(dimmer_tuv), 1.0f);
+            }
+          } else if (duty_tuv >= 0.97f) {
+            set_dimmer(id(dimmer_tuv), 1.0f);
+            if (id(bypass_tuv_armed) && (now - id(bypass_tuv_change_ms) > BYPASS_MIN_DWELL_MS)) {
+              want_bypass_tuv = true;
+              id(bypass_tuv_change_ms) = now;
+              id(bypass_tuv_armed) = false;
+            } else {
+              id(bypass_tuv_armed) = true;
+            }
+          } else {
+            id(bypass_tuv_armed) = false;
+            set_dimmer(id(dimmer_tuv), duty_tuv);
+          }
+          id(bypass_tuv_fve) = want_bypass_tuv;
+          bool bypass_tuv_ciel = want_bypass_tuv || daikin_override_tuv;
+          prepni(id(bypass_tuv), bypass_tuv_ciel);
+          // ODHAD VÝKONU do špirál (pre počítadlá energie) — nemeriame prúd (CUR-S
+          // nezmeraný), preto: menovitý výkon × požadovaný podiel výkonu (prepočet na
+          // úroveň LINEAR krivky v set_dimmer, overené meraním),
+          // bypass zopnutý = menovitý výkon. Bypass TUV len kvôli Daikinu (K3M) sa
+          // počíta zvlášť — to je ohrev zo siete na žiadosť Daikinu, nie z FVE.
+          if (id(bypass_tuv).state) {
+            bool fve = id(bypass_tuv_fve);
+            id(p_odhad_tuv) = fve ? CAP_TUV : 0.0f;
+            id(p_odhad_tuv_daikin) = fve ? 0.0f : CAP_TUV;
+          } else {
+            id(p_odhad_tuv) = duty_tuv * CAP_TUV;
+            id(p_odhad_tuv_daikin) = 0.0f;
+          }
+          // --- BYPASS STYKAČ PODLAHA — rovnaká logika, bez Daikina
+          if (id(bypass_podlaha).state) {
+            if (duty_pod <= 0.95f && (now - id(bypass_podlaha_change_ms) > BYPASS_MIN_DWELL_MS)
+                && prepni(id(bypass_podlaha), false)) {
+              id(bypass_podlaha_change_ms) = now;
+              set_dimmer(id(dimmer_podlaha), duty_pod);
+            } else {
+              set_dimmer(id(dimmer_podlaha), 1.0f);
+            }
+          } else if (duty_pod >= 0.97f) {
+            set_dimmer(id(dimmer_podlaha), 1.0f);
+            if (id(bypass_podlaha_armed) && (now - id(bypass_podlaha_change_ms) > BYPASS_MIN_DWELL_MS)
+                && prepni(id(bypass_podlaha), true)) {
+              id(bypass_podlaha_change_ms) = now;
+              id(bypass_podlaha_armed) = false;
+            } else {
+              id(bypass_podlaha_armed) = true;
+            }
+          } else {
+            id(bypass_podlaha_armed) = false;
+            set_dimmer(id(dimmer_podlaha), duty_pod);
+          }
+          id(p_odhad_pod) = id(bypass_podlaha).state ? CAP_POD : duty_pod * CAP_POD;
+          // --- IZOLAČNÉ STYKAČE: slnečný deň v okne FVE (is_day, viď vyššie). Podlaha len
+          // v režime ≠ Vypnuté a pri čerpadle ≠ VYP. Manuálny výkon prebíja okno.
+          bool st_tuv = is_day || manual_tuv_active;
+          bool st_pod = (is_day && rezim != 0 && !cerpadlo_pod_vyp) || manual_podlaha_active;
+          prepni(id(stykac_tuv), st_tuv);
+          prepni(id(stykac_podlaha), st_pod);
+          //
+          // --- ČERPADLO TUV (náhrada TechController ECO) ---------------------------
+          bool je_vikend = (t.day_of_week == 1 || t.day_of_week == 7);   // 1 = nedeľa, 7 = sobota
+          int min_teraz = t.hour * 60 + t.minute;
+          int okno_od = je_vikend ? (int) id(cerpadlo_tuv_okno_vikend_od).state
+                                   : (int) id(cerpadlo_tuv_okno_pracovny_od).state;
+          int okno_do = je_vikend ? (int) id(cerpadlo_tuv_okno_vikend_do).state
+                                   : (int) id(cerpadlo_tuv_okno_pracovny_do).state;
+          bool v_okne = t.is_valid() && min_teraz >= okno_od && min_teraz <= okno_do;
+          float rozdiel_tuv = id(t_tuv).state - id(t_tuv_vratna).state;
+          // (1) ODBER: prietokomer "ide" + (bojler − vratná) > prah → beh na pevný čas
+          if (v_okne && id(odber_tuv).state && rozdiel_tuv > id(delta_tuv_cerpadlo).state) {
+            id(cerpadlo_tuv_flow_until_ms) = now
+                + (uint32_t)(id(cerpadlo_tuv_operation_min).state * 60000.0f);
+          }
+          bool c_odber = (int32_t)(id(cerpadlo_tuv_flow_until_ms) - now) > 0;
+          // (2) ÚDRŽBA: (bojler − vratná) > prah → beží, kým rozdiel neklesne o 1 °C pod prah
+          if (id(cerpadlo_tuv_udrzba_active)) {
+            if (!v_okne || !(rozdiel_tuv > id(delta_tuv_udrzba).state - 1.0f))
+              id(cerpadlo_tuv_udrzba_active) = false;
+          } else if (v_okne && rozdiel_tuv > id(delta_tuv_udrzba).state) {
+            id(cerpadlo_tuv_udrzba_active) = true;
+          }
+          // (3) POČAS OHREVU (switch, default VYP) — špirála alebo Daikin bypass, dobeh 5 min
+          if (id(cerpadlo_tuv_pri_ohreve).state && (duty_tuv > 0.01f || daikin_override_tuv)) {
+            id(cerpadlo_tuv_ohrev_until_ms) = now + 5UL * 60000UL;
+          }
+          bool c_ohrev = (int32_t)(id(cerpadlo_tuv_ohrev_until_ms) - now) > 0;
+          // (4) HORÚCA TUV + SLNKO: bojler ≥ prah, kým svieti slnko (prebytok > 200 W
+          // niekedy za posledných 10 min), hysteréza 2 °C
+          if (id(prebytok_W) > 200.0f) id(slnko_last_ms) = now;
+          bool slnko = is_day && id(slnko_last_ms) != 0 && (now - id(slnko_last_ms) < 600000);
+          if (id(cerpadlo_tuv_horuca_active)) {
+            if (!slnko || !(id(t_tuv).state >= id(cerpadlo_tuv_horuca_t).state - 2.0f))
+              id(cerpadlo_tuv_horuca_active) = false;
+          } else if (slnko && id(t_tuv).state >= id(cerpadlo_tuv_horuca_t).state) {
+            id(cerpadlo_tuv_horuca_active) = true;
+          }
+          bool c_tuv = c_ohrev || id(cerpadlo_tuv_horuca_active) || c_odber
+                       || id(cerpadlo_tuv_udrzba_active) || manual_tuv_active;
+          // TVRDÝ REŽIM (2026-11-16, servis): VYP = nikdy, Trvalo ZAP = vždy — bez ohľadu
+          // na čokoľvek (aj manuál). Vypnutie hneď (nečaká na limit 1 relé/cyklus).
+          int m_tuv = (int) id(rezim_cerpadla_tuv).active_index().value_or(2);
+          if (m_tuv == 2) {
+            if (id(cerpadlo_tuv).state) id(cerpadlo_tuv).turn_off();
+          } else {
+            prepni(id(cerpadlo_tuv), m_tuv == 1 || c_tuv);
+          }
+          std::string dovod;
+          if (m_tuv == 2) dovod = "VYP (servis)";
+          else if (m_tuv == 1) dovod = "trvalo ZAP";
+          auto pridaj = [&](bool b, const char *s) { if (b) { if (!dovod.empty()) dovod += ", "; dovod += s; } };
+          if (m_tuv == 0) {
+            pridaj(c_odber, "odber");
+            pridaj(id(cerpadlo_tuv_udrzba_active), "údržba");
+            pridaj(c_ohrev, "ohrev");
+            pridaj(id(cerpadlo_tuv_horuca_active), "horúca TUV");
+            pridaj(manual_tuv_active, "manuál");
+          }
+          if (dovod.empty()) dovod = "—";
+          if (id(cerpadlo_tuv_dovod_txt).state != dovod) id(cerpadlo_tuv_dovod_txt).publish_state(dovod);
+          //
+          // --- VENTILÁTOR SKRINE: podľa výkonu TRIAC-ov (min 35 %, dobeh 60 s).
+          // Daikin bypass TRIAC nezaťažuje → nechladí sa.
+          float fan_duty = std::max(duty_tuv, duty_pod);
+          float fan_level = 0.0f;
+          if (fan_duty > 0.02f) {
+            id(fan_afterrun_until_ms) = now + 60000;
+            fan_level = 0.35f + fan_duty * 0.65f;
+          } else if ((int32_t)(id(fan_afterrun_until_ms) - now) > 0) {
+            fan_level = 0.35f;
+          }
+          id(fan_pwm).set_level(fan_level);
+          id(fan_skrine_pct) = fan_level * 100.0f;
+          // --- FANY NA DOSKÁCH DIMMEROV: ZAP, keď dimmer beží (dobeh 60 s) ALEBO
+          // TRIAC ≥ 50 °C (do < 45 °C) — teplota len pri „Teplota TRIAC — zapojená“.
+          if (duty_tuv > 0.01f) id(fan_tuv_until_ms) = now + 60000;
+          if (duty_pod > 0.01f) id(fan_pod_until_ms) = now + 60000;
+          bool f_tuv = (int32_t)(id(fan_tuv_until_ms) - now) > 0 || id(fan_tuv_teplo);
+          bool f_pod = (int32_t)(id(fan_pod_until_ms) - now) > 0 || id(fan_pod_teplo);
+          if (f_tuv != id(fan_dimmer_tuv).state) { if (f_tuv) id(fan_dimmer_tuv).turn_on(); else id(fan_dimmer_tuv).turn_off(); }
+          if (f_pod != id(fan_dimmer_podlaha).state) { if (f_pod) id(fan_dimmer_podlaha).turn_on(); else id(fan_dimmer_podlaha).turn_off(); }
+
+# ============================================================================
+# SOLAX CLOUD z HA (2026-11-15) — sensor.solax_cloud_realtime: stav = čas
+# merania (dataTime, ISO), atribúty battery_power (+ nabíja), battery_soc,
+# grid_power (+ pretok, − odber). Všetko z JEDNÉHO čítania cloudu.
+# ============================================================================
+# (sensor/text_sensor sú v sekciách vyššie — viď "SOLAX CLOUD" tam)
+
+# ============================================================================
+# PRE SOLAX DONGL (neskôr, ~2026-11-20) — lokálne API každé 3 s namiesto cloudu.
+# Pôvodný návrh z 2026-11-09 (indexy registrov sú PREDPOKLAD — overiť proti
+# appke). Po príchode donglu: naplniť solax_bat_ha/solax_grid_ha/solax_soc_ha
+# ekvivalenty z donglu a krok zo Solaxu robiť pri každom čítaní (K_SOLAX 0,3,
+# rezerva 50 W) — zvyšok regulácie ostáva.
+# ----------------------------------------------------------------------------
+#   - interval: 3s
+#     then:
+#       - http_request.post:
+#           url: !secret solax_url
+#           request_headers:
+#             Content-Type: application/x-www-form-urlencoded
+#           body: !secret solax_post_body
+#           capture_response: true
+#           max_response_buffer_size: 4096
+#           on_response:
+#             then:
+#               - lambda: |-
+#                   if (response->status_code != 200) return;
+#                   bool ok = json::parse_json(body, [](JsonObject root) -> bool {
+#                     JsonArray d = root["Data"];
+#                     if (d.isNull() || d.size() < 104) return false;
+#                     int16_t bat = (int16_t) (uint16_t) d[41].as<uint32_t>();          // W, + nabíja
+#                     int32_t feed = (int32_t) ((d[35].as<uint32_t>() << 16)
+#                                               | (d[34].as<uint32_t>() & 0xFFFF));     // W, + pretok
+#                     float soc = d[103].as<float>();                                    // %
+#                     if (soc < 0.0f || soc > 100.0f) return false;
+#                     id(bat_power_W) = bat;
+#                     id(grid_export_W) = feed;
+#                     id(bat_soc) = soc;
+#                     return true;
+#                   });
+#                   if (ok) id(solax_last_ms) = millis();
+# ----------------------------------------------------------------------------

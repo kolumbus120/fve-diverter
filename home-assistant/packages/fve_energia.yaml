@@ -1,0 +1,49 @@
+# ============================================================================
+# FVE diverter — týždenné a mesačné súčty energie (2026-11-15)
+# ============================================================================
+# Zdroj: celkové súčty z ESP (sensor.fve_diverter_energia_*_celkom — odhad z
+# úrovne dimmera × menovitý výkon špirály, nikdy sa nenulujú). Denné súčty robí
+# priamo ESP (sensor.fve_diverter_energia_*_dnes). Všetko ide cez HA do InfluxDB
+# (integrácia InfluxDB zapisuje všetky entity), takže história ostáva aj po
+# vynulovaní denného / týždenného / mesačného počítadla.
+# Týždeň začína v pondelok o polnoci, mesiac 1. dňa o polnoci.
+#
+# K3M rozdelené na zo siete / zo slnka (2026-11-16): týždeň/mesiac sú UI helpery
+# (Nastavenia → Pomocníci, utility_meter, bez reštartu HA), NIE v tomto súbore:
+#   sensor.fve_diverter_energia_do_tuv_cez_k3m_zo_siete_tyzden / _mesiac
+#   sensor.fve_diverter_energia_do_tuv_cez_k3m_zo_slnka_tyzden / _mesiac
+# zdroj: sensor.fve_diverter_energia_do_tuv_k3m_zo_siete_celkom / _zo_slnka_celkom
+# ============================================================================
+utility_meter:
+  fve_energia_tuv_tyzden:
+    name: "FVE energia do TUV — týždeň"
+    unique_id: fve_energia_tuv_tyzden
+    source: sensor.fve_diverter_energia_do_tuv_celkom
+    cycle: weekly
+  fve_energia_tuv_mesiac:
+    name: "FVE energia do TUV — mesiac"
+    unique_id: fve_energia_tuv_mesiac
+    source: sensor.fve_diverter_energia_do_tuv_celkom
+    cycle: monthly
+
+  fve_energia_tuv_daikin_tyzden:
+    name: "Energia do TUV cez Daikin K3M — týždeň"
+    unique_id: fve_energia_tuv_daikin_tyzden
+    source: sensor.fve_diverter_energia_do_tuv_daikin_k3m_celkom
+    cycle: weekly
+  fve_energia_tuv_daikin_mesiac:
+    name: "Energia do TUV cez Daikin K3M — mesiac"
+    unique_id: fve_energia_tuv_daikin_mesiac
+    source: sensor.fve_diverter_energia_do_tuv_daikin_k3m_celkom
+    cycle: monthly
+
+  fve_energia_podlaha_tyzden:
+    name: "FVE energia do podlahy — týždeň"
+    unique_id: fve_energia_podlaha_tyzden
+    source: sensor.fve_diverter_energia_do_podlahy_celkom
+    cycle: weekly
+  fve_energia_podlaha_mesiac:
+    name: "FVE energia do podlahy — mesiac"
+    unique_id: fve_energia_podlaha_mesiac
+    source: sensor.fve_diverter_energia_do_podlahy_celkom
+    cycle: monthly

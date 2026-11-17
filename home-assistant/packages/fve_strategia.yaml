@@ -1,0 +1,635 @@
+# ============================================================================
+# FVE STRATÉGIA — pomalé rozhodnutia v HA k FVE diverteru (ESP32 #2)
+# ============================================================================
+# Návrh 2026-11-09. Rýchla regulácia (rozdelenie prebytku podlaha → TUV/batéria,
+# čerpadlá, stykače) beží na ESP32 (esp32-fve-diverter/fve-diverter.yaml) a
+# funguje aj bez HA. Tu sú len rozhodnutia v minútach:
+#   1. Daikin kúrenie cez slnko → znížiť (posun −10 °C) / vypnúť / nechať
+#   2. Daikin TUV zablokovaná, ohreje slnko cez špirálu (2026-11-16):
+#      - pracovný deň: 06:00–15:00 len podľa času (nikto nie je doma),
+#      - voľný deň (víkend, sviatok, prázdniny): od začiatku okna FVE z ESP;
+#        bez slnečného dňa do 60 min → na celý deň zrušené, inak do konca okna,
+#      - ručný performance má vždy prednosť (nezačne sa, nepreruší sa, dnes už
+#        sa neblokuje); na konci sa obnoví len "on".
+#   1+. Slnečný režim Daikinu len v SLNEČNÝ DEŇ z ESP (prvý prebytok ≥ 100 W
+#      v okne východ + 2 h … západ − 2 h) a od prebytku 700 W. Inak plán kúrenia.
+#   3. Tech M-9R: podlaha naplno → zóny +2 °C (voda tečie všade), po skončení
+#      ohrevu podlahy späť
+#   4. Solcast: slabá predpoveď na zajtra → Solax min SoC 40 % (záloha na výpadok)
+#   5. Dovolenka (dátumy v pláne kúrenia, binary_sensor.plan_dovolenka): TUV
+#      z Daikinu vypnutá, obeh TUV vypnutý; kúrenie = útlm (daikin_plan_kurenia.yaml)
+#   6. Obeh TUV pri ohreve automaticky, keď sme doma (víkend/sviatok/prázdniny)
+#   Prázdniny = ručný prepínač input_boolean.fve_prazdniny ALEBO dátumy v pláne
+#   kúrenia (binary_sensor.plan_prazdniny).
+#
+# NASADENÉ 2026-11-15 (spolu s ostrou verziou ESP, rozhodnutie usera: všetko
+# naraz). Časť 4 (Solcast → min SoC) čaká na entitu number.solax_min_soc
+# z lokálneho donglu — dovtedy sa nespustí (podmienka has_value).
+# NASADENIE (postup):
+#   a) configuration.yaml — doplniť (EDITOM, nie prepísaním celého súboru —
+#      inak zmiznú include riadky, viď poznámka v pamäti projektu):
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   b) skopírovať tento súbor do /config/packages/, reštart HA
+#   c) RAZ spustiť script.fve_strategia_predvolene_hodnoty (helpery bez
+#      `initial`, aby si HA pamätal ladenie cez reštart — preto defaulty skriptom)
+#   d) ZRUŠIŤ staré automatizácie "FVE prebytok — boiler performance ZAP/VYP"
+#      (dočasné riešenie, rozhodnutie 2026-11-09)
+#   d2) (2026-11-16) Nočný režim Daikinu aj Dovolenka zrušené. Posun teploty
+#      vody (number.space_heating_temperature_control) určuje JEDINÝ zdroj —
+#      sensor.daikin_cielovy_posun_kurenia z packages/daikin_plan_kurenia.yaml
+#      (plán normál/útlm + slnko z tejto stratégie má prednosť). Skript nižšie
+#      ho len aplikuje. Zap/vyp kúrenia cez slnko ("Vypnúť") ostáva tu.
+#   e) overiť entity označené TODO nižšie
+#
+# ENTITY Z ESP (odvodené z mien v fve-diverter.yaml, friendly_name "FVE
+# diverter" — TODO overiť po prvom pripojení ESP k HA):
+#   sensor.fve_diverter_prebytok_dostupny        (W)
+#   sensor.fve_diverter_vykon_podlaha            (%)
+#   binary_sensor.fve_diverter_ohrev_podlahy_z_fve
+#   select.fve_diverter_rezim_kurenia            ("Vypnuté (leto)" / "Len z prebytkov" / "Kúrenie zapnuté")
+#   switch.fve_diverter_cerpadlo_tuv_pocas_ohrevu
+# TODO entity, ktoré ešte nemáme:
+#   sensor.daikin_prikon_w — okamžitý príkon Daikinu (W); bez neho sa "slnko"
+#     vyhodnocuje len z prebytku NAD spotrebu bežiaceho Daikinu (prepne neskôr)
+#   number.solax_min_soc — min SoC v Self Use (z novej lokálnej Solax integrácie)
+# ============================================================================
+
+input_select:
+  fve_daikin_pri_prebytku:
+    name: "Daikin kúrenie pri prebytku FVE"
+    icon: mdi:heat-pump
+    options:
+      - "Znížiť (−10 °C)"
+      - "Vypnúť"
+      - "Nechať bežať"
+
+input_number:
+  fve_daikin_prebytok_zap_w:
+    name: "Daikin slnko — prah zapnutia (prebytok)"
+    min: 100
+    max: 3000
+    step: 50
+    unit_of_measurement: W
+    mode: box
+  fve_daikin_prebytok_vyp_w:
+    name: "Daikin slnko — prah ukončenia (prebytok)"
+    min: 0
+    max: 2000
+    step: 50
+    unit_of_measurement: W
+    mode: box
+  fve_daikin_offset_slnko:
+    name: "Daikin — posun teploty vody cez slnko"
+    min: -10
+    max: 0
+    step: 1
+    unit_of_measurement: "°C"
+  fve_daikin_min_zmena_min:
+    name: "Daikin — min. čas medzi zmenami (kompresor)"
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: min
+    mode: box
+  fve_tech_zvysenie:
+    name: "Tech M-9R — zvýšenie zón pri podlahe naplno"
+    min: 0.5
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°C"
+  fve_solcast_prah_kwh:
+    name: "Solcast — prah zajtrajšej výroby pre rezervu"
+    min: 0
+    max: 60
+    step: 0.5
+    unit_of_measurement: kWh
+    mode: box
+  fve_solax_min_soc_rezerva:
+    name: "Solax min SoC — rezerva (slabý zajtrajšok)"
+    min: 10
+    max: 90
+    step: 5
+    unit_of_measurement: "%"
+  fve_tuv_volny_den_cakat_min:
+    name: "Daikin TUV voľný deň — čakať na slnko"
+    min: 0
+    max: 240
+    step: 10
+    unit_of_measurement: min
+    mode: box
+  fve_solax_min_soc_normal:
+    name: "Solax min SoC — bežne"
+    min: 10
+    max: 90
+    step: 5
+    unit_of_measurement: "%"
+
+input_boolean:
+  fve_daikin_slnko_aktivne:
+    name: "Daikin — slnečný režim aktívny (stav automatiky)"
+    icon: mdi:weather-sunny
+  fve_daikin_kurenie_vypnute_automatikou:
+    name: "Daikin — kúrenie vypnuté automatikou (stav)"
+  fve_tuv_blokovat_pracovny_den:
+    name: "Daikin TUV — blokovať v pracovný deň (ohreje slnko)"
+    icon: mdi:water-boiler-off
+  fve_tuv_blokovane:
+    name: "Daikin TUV — zablokované automatikou (stav)"
+  fve_tuv_blokovat_volny_den:
+    name: "Daikin TUV — vo voľný deň čakať na slnko"
+    icon: mdi:weather-sunny-alert
+  fve_tuv_rucne_dnes:
+    name: "Daikin TUV — ručný performance dnes (stav, dnes neblokovať)"
+    icon: mdi:hand-back-right
+  fve_tech_spalna_spolu:
+    name: "Tech M-9R — zvyšovať aj spálňu"
+    icon: mdi:bed
+  fve_tech_zvysene:
+    name: "Tech M-9R — zóny zvýšené automatikou (stav)"
+  # Obeh TUV počas ohrevu (2026-11-09): bojler ho nepotrebuje, zmysel má len
+  # keď sme doma (teplá voda hneď v potrubí). V pracovný deň by voda v okruhu
+  # zbytočne chladla. AUTO = HA prepína switch na ESP podľa toho, či sme doma.
+  fve_cerpadlo_tuv_doma_auto:
+    name: "Obeh TUV pri ohreve — automaticky keď sme doma"
+    icon: mdi:home-thermometer
+  fve_prazdniny:
+    name: "Prázdniny (deti doma)"
+    icon: mdi:school-outline
+
+input_datetime:
+  fve_tuv_blok_od:
+    name: "Daikin TUV blokovanie — od"
+    has_date: false
+    has_time: true
+  fve_tuv_blok_do:
+    name: "Daikin TUV blokovanie — do (potom dohreje Daikin)"
+    has_date: false
+    has_time: true
+
+input_text:
+  fve_tuv_povodny_rezim:
+    name: "Daikin TUV — pôvodný režim (uložený automatikou)"
+    max: 20
+  fve_tech_povodne_teploty:
+    name: "Tech M-9R — pôvodné teploty zón (uložené automatikou)"
+    max: 255
+
+template:
+  - sensor:
+      # Prebytok, ktorý by bol k dispozícii, keby Daikin nebežal — podľa neho
+      # sa rozhoduje "FVE sa prebúdza → Daikin dole". Bez sensor.daikin_prikon_w
+      # (TODO) je to len prebytok nad spotrebu domu VRÁTANE bežiaceho Daikinu.
+      - name: "FVE prebytok vrátane Daikinu"
+        unique_id: fve_prebytok_vratane_daikinu
+        unit_of_measurement: W
+        device_class: power
+        state_class: measurement
+        state: >
+          {{ (states('sensor.fve_diverter_prebytok_dostupny') | float(0)
+              + states('sensor.daikin_prikon_w') | float(0)) | round(0) }}
+        availability: "{{ has_value('sensor.fve_diverter_prebytok_dostupny') }}"
+
+  - binary_sensor:
+      # "Svieti slnko pre Daikin" — hysteréza (zap/vyp prah) + oneskorenia,
+      # aby mraky neprepínali Daikin. ON po 10 min nad prahom zap, OFF po
+      # 20 min pod prahom vyp.
+      - name: "FVE slnko pre Daikin"
+        unique_id: fve_slnko_pre_daikin
+        icon: mdi:weather-sunny
+        state: >
+          {% set p = states('sensor.fve_prebytok_vratane_daikinu') | float(0) %}
+          {% if p > states('input_number.fve_daikin_prebytok_zap_w') | float(400) %}true
+          {% elif p < states('input_number.fve_daikin_prebytok_vyp_w') | float(100) %}false
+          {% else %}{{ is_state('binary_sensor.fve_slnko_pre_daikin', 'on') }}{% endif %}
+        delay_on: "00:10:00"
+        delay_off: "00:20:00"
+
+      # Podlaha naplno (≥ 95 % aspoň 5 min) → Tech M-9R zóny hore.
+      - name: "FVE podlaha naplno"
+        unique_id: fve_podlaha_naplno
+        icon: mdi:heating-coil
+        state: "{{ states('sensor.fve_diverter_vykon_podlaha') | float(0) >= 95 }}"
+        delay_on: "00:05:00"
+
+script:
+  # --------------------------------------------------------------------------
+  # Jednorazovo po nasadení — predvolené hodnoty helperov (rozhodnutia 2026-11-09).
+  # --------------------------------------------------------------------------
+  fve_strategia_predvolene_hodnoty:
+    alias: "FVE stratégia — nastav predvolené hodnoty"
+    sequence:
+      - action: input_select.select_option
+        target: { entity_id: input_select.fve_daikin_pri_prebytku }
+        data: { option: "Znížiť (−10 °C)" }
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_daikin_prebytok_zap_w }
+        data: { value: 700 }   # 2026-11-16: 700 W = slnko sa naozaj rozbieha (rozptýlené svetlo ≤ ~500 W)
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_daikin_prebytok_vyp_w }
+        data: { value: 100 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_daikin_offset_slnko }
+        data: { value: -10 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_daikin_min_zmena_min }
+        data: { value: 30 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_tech_zvysenie }
+        data: { value: 2 }
+      # 11,5 kWh batéria (odvodené zo Solax zostatok/SoC 2026-11-09): 20→100 %
+      # ≈ 9 kWh + denná spotreba domu → 14 kWh. Pod tým rezerva 40 %.
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_solcast_prah_kwh }
+        data: { value: 14 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_solax_min_soc_rezerva }
+        data: { value: 40 }
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_solax_min_soc_normal }
+        data: { value: 20 }
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.fve_tuv_blokovat_pracovny_den }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.fve_tech_spalna_spolu }
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.fve_cerpadlo_tuv_doma_auto }
+      - action: input_datetime.set_datetime
+        target: { entity_id: input_datetime.fve_tuv_blok_od }
+        data: { time: "06:00:00" }
+      - action: input_datetime.set_datetime
+        target: { entity_id: input_datetime.fve_tuv_blok_do }
+        data: { time: "15:00:00" }   # 2026-11-16: domov prichádzame o 15:00
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.fve_tuv_blokovat_volny_den }
+      - action: input_number.set_value
+        target: { entity_id: input_number.fve_tuv_volny_den_cakat_min }
+        data: { value: 60 }
+
+  # --------------------------------------------------------------------------
+  # Daikin kúrenie — aplikuj želaný stav (volá sa pri každej zmene vstupov).
+  # Zásada: meníme len to, čo sme sami zmenili (stavové input_boolean-y), a
+  # pôvodný stav vraciame. Ručné zapnutie/vypnutie mimo našich zásahov nechávame.
+  # --------------------------------------------------------------------------
+  fve_daikin_aplikuj:
+    alias: "FVE stratégia — Daikin kúrenie: aplikuj stav"
+    mode: queued
+    sequence:
+      - variables:
+          rezim: "{{ states('select.fve_diverter_rezim_kurenia') }}"
+          slnko: "{{ is_state('input_boolean.fve_daikin_slnko_aktivne', 'on') }}"
+          # Cieľový posun teploty vody: plán kúrenia (normál/útlm) a slnko
+          # (znížiť) spolu — počíta packages/daikin_plan_kurenia.yaml.
+          ciel: "{{ states('sensor.daikin_cielovy_posun_kurenia') | int(-99) }}"
+          aktualny: "{{ states('number.space_heating_temperature_control') | int(-99) }}"
+          sposob: "{{ states('input_select.fve_daikin_pri_prebytku') }}"
+      - variables:
+          # Len z prebytkov: Daikin kúrenie stále VYP (podlaha len zo špirály).
+          vypnut: >
+            {{ rezim == 'Len z prebytkov'
+               or (rezim == 'Kúrenie zapnuté' and slnko and sposob == 'Vypnúť') }}
+      # 1) Posun teploty vody (number.space_heating_temperature_control, −10..+10)
+      #    na cieľ zo sensor.daikin_cielovy_posun_kurenia. Pred zápisom si cieľ
+      #    zapamätáme (input_number.daikin_offset_posledny_ciel) — podľa toho
+      #    automatizácia v pláne rozozná ručnú zmenu od našej.
+      #    Porovnávame aj s posledným odoslaným cieľom — stav number sa po zápise
+      #    obnoví až s oneskorením a rýchlo za sebou idúce behy by inak videli
+      #    starú hodnotu a zmenu vynechali.
+      - if: >
+          {{ ciel != -99 and aktualny != -99
+             and (ciel != aktualny
+                  or ciel != states('input_number.daikin_offset_posledny_ciel') | int(-99)) }}
+        then:
+          - action: input_number.set_value
+            target: { entity_id: input_number.daikin_offset_posledny_ciel }
+            data: { value: "{{ ciel }}" }
+          - action: number.set_value
+            target: { entity_id: number.space_heating_temperature_control }
+            data: { value: "{{ ciel }}" }
+      # 2) Kúrenie zap/vyp (switch.space_heating_climate_control)
+      - if: "{{ vypnut and is_state('switch.space_heating_climate_control', 'on') }}"
+        then:
+          - action: switch.turn_off
+            target: { entity_id: switch.space_heating_climate_control }
+          - action: input_boolean.turn_on
+            target: { entity_id: input_boolean.fve_daikin_kurenie_vypnute_automatikou }
+      - if: "{{ not vypnut and is_state('input_boolean.fve_daikin_kurenie_vypnute_automatikou', 'on') }}"
+        then:
+          # Zapnúť späť len v režime "Kúrenie zapnuté" (v lete/pri prepnutí na
+          # "Vypnuté" len zabudneme, že sme ho vypli — nechá sa vypnuté).
+          - if: "{{ rezim == 'Kúrenie zapnuté' }}"
+            then:
+              - action: switch.turn_on
+                target: { entity_id: switch.space_heating_climate_control }
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.fve_daikin_kurenie_vypnute_automatikou }
+
+  # --------------------------------------------------------------------------
+  # Daikin TUV — blokovanie (ohreje slnko cez špirálu), 2026-11-16:
+  #  - dovolenka (plán kúrenia): blokované stále
+  #  - pracovný deň: input_datetime fve_tuv_blok_od … do (06:00–15:00), len čas
+  #  - voľný deň (víkend/sviatok/prázdniny): od začiatku okna FVE (ESP); keď do
+  #    N min nezačne slnečný deň → na celý deň zrušené, inak do konca okna FVE
+  #  - ručný performance má prednosť: blokovanie sa nezačne, kým beží; zapnutý
+  #    počas blokovania sa nepreruší a v ten deň sa už neblokuje (fve_tuv_rucne_dnes)
+  #  - začína sa len z režimu "on"; na konci sa obnoví "on" (performance nikdy
+  #    automaticky — zapína 3 kW záložnú špirálu zo siete)
+  # --------------------------------------------------------------------------
+  fve_tuv_aplikuj:
+    alias: "FVE stratégia — Daikin TUV: aplikuj blokovanie"
+    mode: queued
+    sequence:
+      - variables:
+          rezim: "{{ states('water_heater.hot_water_tank_domestic_hot_water_tank') }}"
+          blokovat: >-
+            {%- set pracovny = is_state('binary_sensor.workday_sensor_sk', 'on')
+                               and not is_state('input_boolean.fve_prazdniny', 'on')
+                               and not is_state('binary_sensor.plan_prazdniny', 'on') -%}
+            {%- set od = states('sensor.fve_diverter_okno_fve_zaciatok') | as_datetime(none) -%}
+            {%- set do = states('sensor.fve_diverter_okno_fve_koniec') | as_datetime(none) -%}
+            {%- set sl = states('sensor.fve_diverter_slnecny_den_od') | as_datetime(none) -%}
+            {%- set cakat = timedelta(minutes=states('input_number.fve_tuv_volny_den_cakat_min') | int(60)) -%}
+            {%- if is_state('input_boolean.fve_tuv_rucne_dnes', 'on') or rezim == 'performance' -%}
+              {%- set b = false -%}
+            {%- elif is_state('binary_sensor.plan_dovolenka', 'on') -%}
+              {%- set b = true -%}
+            {%- elif pracovny -%}
+              {%- set b = is_state('input_boolean.fve_tuv_blokovat_pracovny_den', 'on')
+                          and today_at(states('input_datetime.fve_tuv_blok_od')) <= now()
+                          and now() < today_at(states('input_datetime.fve_tuv_blok_do')) -%}
+            {%- else -%}
+              {%- set b = is_state('input_boolean.fve_tuv_blokovat_volny_den', 'on')
+                          and od is not none and do is not none
+                          and od <= now() and now() < do
+                          and (now() < od + cakat
+                               or (sl is not none and od <= sl and sl <= od + cakat)) -%}
+            {%- endif -%}
+            {{ b }}
+      - if: "{{ blokovat and rezim == 'on' and is_state('input_boolean.fve_tuv_blokovane', 'off') }}"
+        then:
+          - action: water_heater.set_operation_mode
+            target: { entity_id: water_heater.hot_water_tank_domestic_hot_water_tank }
+            data: { operation_mode: "off" }
+          - action: input_boolean.turn_on
+            target: { entity_id: input_boolean.fve_tuv_blokovane }
+      - if: "{{ not blokovat and is_state('input_boolean.fve_tuv_blokovane', 'on') }}"
+        then:
+          - if: "{{ rezim == 'performance' }}"
+            then:
+              # ručný performance počas blokovania → nechať dobehnúť, dnes už neblokovať
+              - action: input_boolean.turn_on
+                target: { entity_id: input_boolean.fve_tuv_rucne_dnes }
+            else:
+              - action: water_heater.set_operation_mode
+                target: { entity_id: water_heater.hot_water_tank_domestic_hot_water_tank }
+                data: { operation_mode: "on" }
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.fve_tuv_blokovane }
+
+  # --------------------------------------------------------------------------
+  # Tech M-9R — zvýšiť zóny (podlaha naplno) / vrátiť pôvodné teploty.
+  # Pôvodné teploty sa ukladajú do input_text (prežije reštart HA, na rozdiel
+  # od scene.create snapshotu).
+  # --------------------------------------------------------------------------
+  fve_tech_zvys:
+    alias: "FVE stratégia — Tech M-9R: zvýš zóny"
+    mode: single
+    sequence:
+      - variables:
+          zony: >
+            {% set z = ['climate.doma_eu_m9r_detska', 'climate.doma_eu_m9r_host',
+                        'climate.doma_eu_m9r_kuchyna', 'climate.doma_eu_m9r_obi_jed'] %}
+            {% if is_state('input_boolean.fve_tech_spalna_spolu', 'on') %}
+              {% set z = z + ['climate.doma_eu_m9r_spalna'] %}
+            {% endif %}
+            {{ z }}
+          zvysenie: "{{ states('input_number.fve_tech_zvysenie') | float(2) }}"
+      # Formát "zona=teplota;zona=teplota" — zámerne NIE JSON: výsledok šablóny,
+      # ktorý vyzerá ako JSON, HA prevedie na dict a do input_text by sa uložila
+      # Python reprezentácia (s apostrofmi), ktorú by obnovenie neprečítalo.
+      - action: input_text.set_value
+        target: { entity_id: input_text.fve_tech_povodne_teploty }
+        data:
+          value: >-
+            {% for z in zony %}{{ z.split('.')[1] }}={{ state_attr(z, 'temperature') | float(21) }}{% if not loop.last %};{% endif %}{% endfor %}
+      - repeat:
+          for_each: "{{ zony }}"
+          sequence:
+            - action: climate.set_temperature
+              target: { entity_id: "{{ repeat.item }}" }
+              data:
+                temperature: "{{ state_attr(repeat.item, 'temperature') | float(21) + zvysenie }}"
+      - action: input_boolean.turn_on
+        target: { entity_id: input_boolean.fve_tech_zvysene }
+
+  fve_tech_obnov:
+    alias: "FVE stratégia — Tech M-9R: vráť pôvodné teploty"
+    mode: single
+    sequence:
+      - repeat:
+          for_each: >
+            {{ states('input_text.fve_tech_povodne_teploty').split(';')
+               | select('search', '=') | list }}
+          sequence:
+            - action: climate.set_temperature
+              target: { entity_id: "climate.{{ repeat.item.split('=')[0] }}" }
+              data: { temperature: "{{ repeat.item.split('=')[1] | float }}" }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.fve_tech_zvysene }
+
+automation:
+  # --------------------------------------------------------------------------
+  # 1. Daikin — slnečný režim (stavový flag). Periodicky prehodnocuje (každých
+  #    5 min), takže nevadí, ak pri hrane nebola splnená podmienka min. času.
+  # --------------------------------------------------------------------------
+  - id: fve_daikin_slnko_flag
+    alias: "FVE stratégia — Daikin slnečný režim (vyhodnotenie)"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.fve_slnko_pre_daikin
+      - trigger: state
+        entity_id: binary_sensor.fve_diverter_slnecny_den
+      - trigger: state
+        entity_id: select.fve_diverter_rezim_kurenia
+      - trigger: state
+        entity_id: input_select.fve_daikin_pri_prebytku
+      - trigger: sun
+        event: sunset
+      - trigger: time_pattern
+        minutes: "/5"
+    actions:
+      - variables:
+          chcem: >
+            {{ is_state('binary_sensor.fve_slnko_pre_daikin', 'on')
+               and is_state('binary_sensor.fve_diverter_slnecny_den', 'on')
+               and is_state('sun.sun', 'above_horizon')
+               and trigger.platform | default('') != 'sun'
+               and is_state('select.fve_diverter_rezim_kurenia', 'Kúrenie zapnuté')
+               and not is_state('input_select.fve_daikin_pri_prebytku', 'Nechať bežať') }}
+          je: "{{ is_state('input_boolean.fve_daikin_slnko_aktivne', 'on') }}"
+          uplynulo_min: >
+            {{ ((now() - states.input_boolean.fve_daikin_slnko_aktivne.last_changed).total_seconds() / 60) | int }}
+          min_zmena: "{{ states('input_number.fve_daikin_min_zmena_min') | int(30) }}"
+      # Ochrana kompresora: min. čas medzi zmenami. Výnimka: západ slnka /
+      # zmena režimu na iný než "Kúrenie zapnuté" → vrátiť hneď.
+      - if: >
+          {{ chcem != je and (uplynulo_min >= min_zmena or not chcem and
+             (trigger.platform == 'sun' or trigger.entity_id | default('') == 'select.fve_diverter_rezim_kurenia')) }}
+        then:
+          - action: "input_boolean.turn_{{ 'on' if chcem else 'off' }}"
+            target: { entity_id: input_boolean.fve_daikin_slnko_aktivne }
+
+  - id: fve_daikin_aplikuj
+    alias: "FVE stratégia — Daikin kúrenie: aplikuj pri zmene"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - input_boolean.fve_daikin_slnko_aktivne
+          - select.fve_diverter_rezim_kurenia
+          - input_select.fve_daikin_pri_prebytku
+      # Cieľový posun z plánu kúrenia — až keď sa ustáli (pri reloade šablón
+      # môže na okamih skočiť).
+      - trigger: state
+        entity_id: sensor.daikin_cielovy_posun_kurenia
+        not_to: ["unavailable", "unknown"]
+        for: { seconds: 10 }
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: script.fve_daikin_aplikuj
+
+  # --------------------------------------------------------------------------
+  # 2. Daikin TUV — blokovanie (pracovný deň / voľný deň / dovolenka, ručný performance)
+  # --------------------------------------------------------------------------
+  - id: fve_tuv_blokovanie
+    alias: "FVE stratégia — Daikin TUV blokovanie (vyhodnotenie)"
+    mode: queued
+    triggers:
+      - trigger: time
+        at: input_datetime.fve_tuv_blok_od
+      - trigger: time
+        at: input_datetime.fve_tuv_blok_do
+      - trigger: state
+        entity_id:
+          - binary_sensor.workday_sensor_sk
+          - input_boolean.fve_prazdniny
+          - binary_sensor.plan_prazdniny
+          - binary_sensor.plan_dovolenka
+          - input_boolean.fve_tuv_blokovat_pracovny_den
+          - input_boolean.fve_tuv_blokovat_volny_den
+          - input_boolean.fve_tuv_rucne_dnes
+          - binary_sensor.fve_diverter_slnecny_den
+          - binary_sensor.fve_diverter_okno_fve
+          - water_heater.hot_water_tank_domestic_hot_water_tank
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/5"
+    actions:
+      - action: script.fve_tuv_aplikuj
+
+  # Ručný performance platí do polnoci
+  - id: fve_tuv_rucne_dnes_reset
+    alias: "FVE stratégia — Daikin TUV: ručný performance, reset o polnoci"
+    triggers:
+      - trigger: time
+        at: "00:00:00"
+    actions:
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.fve_tuv_rucne_dnes }
+
+  # --------------------------------------------------------------------------
+  # 3. Tech M-9R — zóny hore pri podlahe naplno, späť po skončení ohrevu podlahy
+  #    (krátky pokles výkonu pod 95 % ich nevracia — až koniec relácie na ESP)
+  # --------------------------------------------------------------------------
+  - id: fve_tech_zony
+    alias: "FVE stratégia — Tech M-9R zóny (vyhodnotenie)"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.fve_podlaha_naplno
+          - binary_sensor.fve_diverter_ohrev_podlahy_z_fve
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/10"
+    actions:
+      - choose:
+          - conditions: >
+              {{ is_state('binary_sensor.fve_podlaha_naplno', 'on')
+                 and is_state('binary_sensor.fve_diverter_ohrev_podlahy_z_fve', 'on')
+                 and is_state('input_boolean.fve_tech_zvysene', 'off') }}
+            sequence:
+              - action: script.fve_tech_zvys
+          - conditions: >
+              {{ not is_state('binary_sensor.fve_diverter_ohrev_podlahy_z_fve', 'on')
+                 and is_state('input_boolean.fve_tech_zvysene', 'on') }}
+            sequence:
+              - action: script.fve_tech_obnov
+
+  # --------------------------------------------------------------------------
+  # 3b. Obeh TUV počas ohrevu — automaticky ZAP, keď sme doma: víkend, sviatok
+  #     (Workday SK) alebo prázdniny (prepínač alebo dátumy); nie počas dovolenky.
+  #     Keď je AUTO vypnuté, switch na ESP sa ovláda ručne. Obeh pri bojleri
+  #     ≥ 70 °C cez slnko beží na ESP vždy, nezávisle od tohto.
+  # --------------------------------------------------------------------------
+  - id: fve_cerpadlo_tuv_doma
+    alias: "FVE stratégia — obeh TUV pri ohreve podľa toho, či sme doma"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.workday_sensor_sk
+          - input_boolean.fve_prazdniny
+          - binary_sensor.plan_prazdniny
+          - binary_sensor.plan_dovolenka
+          - input_boolean.fve_cerpadlo_tuv_doma_auto
+          - switch.fve_diverter_cerpadlo_tuv_pocas_ohrevu   # napr. po reštarte/pripojení ESP
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: state
+        entity_id: input_boolean.fve_cerpadlo_tuv_doma_auto
+        state: "on"
+    actions:
+      - variables:
+          doma: >
+            {{ not is_state('binary_sensor.plan_dovolenka', 'on')
+               and (is_state('binary_sensor.workday_sensor_sk', 'off')
+                    or is_state('input_boolean.fve_prazdniny', 'on')
+                    or is_state('binary_sensor.plan_prazdniny', 'on')) }}
+      - if: "{{ doma != is_state('switch.fve_diverter_cerpadlo_tuv_pocas_ohrevu', 'on') }}"
+        then:
+          - action: "switch.turn_{{ 'on' if doma else 'off' }}"
+            target: { entity_id: switch.fve_diverter_cerpadlo_tuv_pocas_ohrevu }
+
+  # --------------------------------------------------------------------------
+  # 4. Solcast → Solax min SoC (záloha na výpadok, keď sa zajtra batéria
+  #    pravdepodobne nedobije). Medián predpovede; konzervatívnejšie by bolo
+  #    sensor.solcast_predpoved_zajtra_p10.
+  # --------------------------------------------------------------------------
+  - id: fve_solax_min_soc
+    alias: "FVE stratégia — Solax min SoC podľa Solcastu"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "12:00:00"
+    conditions:
+      - condition: template
+        value_template: "{{ has_value('sensor.solcast_pv_forecast_prepoved_zajtra') }}"
+      # Kým nie je lokálna Solax integrácia (dongl), entita neexistuje → nič nerob.
+      - condition: template
+        value_template: "{{ has_value('number.solax_min_soc') }}"
+    actions:
+      - action: number.set_value
+        target:
+          entity_id: number.solax_min_soc   # TODO: skutočná entita z lokálnej Solax integrácie
+        data:
+          value: >
+            {{ states('input_number.fve_solax_min_soc_rezerva') | int(40)
+               if states('sensor.solcast_pv_forecast_prepoved_zajtra') | float(0)
+                  < states('input_number.fve_solcast_prah_kwh') | float(14)
+               else states('input_number.fve_solax_min_soc_normal') | int(20) }}

@@ -1,0 +1,9 @@
+secrets.yaml
+**/secrets.yaml
+.esphome/
+__pycache__/
+*.pyc
+*.kicad_prl
+fve_doska-backups/
+*.dsn
+*.ses

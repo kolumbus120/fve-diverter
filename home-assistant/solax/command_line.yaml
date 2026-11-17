@@ -1,0 +1,20 @@
+# Solax Cloud (API v2) → HA, kým nie je lokálny dongl. Vložiť do configuration.yaml
+# (alebo do packages/). Skript solax_cloud.py skopírovať do /config/ a do
+# /config/secrets.yaml doplniť solax_client_id / solax_client_secret; v skripte
+# DEV_SN = sériové číslo meniča. Odpovede cloudu sa kešujú 240 s (limit API).
+# ESP (fve-diverter.yaml) číta sensor.solax_cloud_realtime: stav = čas merania
+# (dataTime), atribúty battery_power / battery_soc / grid_power z jedného čítania —
+# pri zmene času spraví ESP jeden krok regulácie podľa nabíjania batérie.
+command_line:
+  - sensor:
+      name: "Solax cloud realtime"
+      unique_id: solax_cloud_realtime
+      command: "python3 /config/solax_cloud.py realtime"
+      scan_interval: 60
+      device_class: timestamp
+      value_template: "{{ value_json.data_time if value_json.data_time else None }}"
+      json_attributes:
+        - battery_power
+        - battery_soc
+        - grid_power
+        - pv_power
