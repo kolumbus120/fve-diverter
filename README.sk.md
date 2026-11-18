@@ -141,10 +141,13 @@ prechodky `prechodky.py`. Gerbery sú v `pcb/vyroba/`.
 > DimmerLink treba ešte overiť na reálnych kusoch.
 >
 > ⚠️ **Rezistory pre vstupy CUR-S (R9–R12) ešte nie sú určené.** Napätie výstupu prúdového
-> snímača CUR-S na doskách RBDimmer výrobca neuvádza a zatiaľ sme ho nezmerali. Kým nebude
-> zmerané, **R9/R11 neosadzuj**:
-> - snímač na 3,3 V → R9/R11 = 0 Ω, R10/R12 neosadiť;
-> - snímač na 5 V → delič (návrh 10 kΩ / 18 kΩ, ešte neoverený).
+> snímača CUR-S na doskách RBDimmer výrobca neuvádza. Čip snímača je identifikovaný ako
+> **CrossChip CC6920SO-50A** (5 V verzia, 40 mV/A, nula = VCC/2, výstup 0,2–4,8 V, môže teda
+> ísť nad 3,3 V). Prvé meranie ukázalo na CUR-S bez prúdu **1,83 V**. To nie je očakávaných
+> 2,5 V, takže trimer na doske zrejme funguje ako delič. Zatiaľ to nie je potvrdené, preto
+> **R9/R11 neosadzuj**:
+> - CUR-S max ≤ 3,3 V → R9/R11 = 0 Ω (alebo sériový ~1 kΩ), R10/R12 neosadiť;
+> - CUR-S môže ísť nad 3,3 V → delič (návrh 10 kΩ / 18 kΩ, ešte neoverený).
 >
 > Firmvér CUR-S len zobrazuje ako napätie, na reguláciu ho nepoužíva. Podrobnosti:
 > [`pcb/README.md`](pcb/README.md), [`docs/MERANIE_rbdimmer.md`](docs/MERANIE_rbdimmer.md).

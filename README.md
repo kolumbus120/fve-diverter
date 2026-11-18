@@ -152,10 +152,13 @@ socket headers, and all wiring goes to locking JST-XH connectors. The board carr
 > the DimmerLink still need to be checked against real parts.
 >
 > ⚠️ **The resistors for the CUR-S current sense inputs (R9–R12) are not decided yet.** The
-> output voltage of the RBDimmer CUR-S sensor is not specified by the manufacturer and we have
-> not measured it yet. Leave **R9/R11 unpopulated** until it is measured:
-> - 3.3 V output → 0 Ω for R9/R11, no R10/R12;
-> - 5 V output → a divider (proposed 10 kΩ / 18 kΩ, not verified yet).
+> output voltage of the RBDimmer CUR-S sensor is not specified by the manufacturer. The sensor
+> chip has been identified as **CrossChip CC6920SO-50A** (5 V version, 40 mV/A, zero current =
+> VCC/2, output 0.2–4.8 V, so it can go above 3.3 V). The first measurement gave **1.83 V** on CUR-S
+> at zero current. That is not the expected 2.5 V, so the on-board trimmer probably acts as a
+> divider. This is not confirmed yet. Leave **R9/R11 unpopulated** until it is:
+> - CUR-S max ≤ 3.3 V → 0 Ω (or ~1 kΩ series) for R9/R11, no R10/R12;
+> - CUR-S can exceed 3.3 V → a divider (proposed 10 kΩ / 18 kΩ, not verified yet).
 >
 > The firmware only displays CUR-S as a voltage; it is not used for regulation. Details:
 > [`pcb/README.md`](pcb/README.md), [`docs/MERANIE_rbdimmer.md`](docs/MERANIE_rbdimmer.md).
